@@ -1,0 +1,53 @@
+{
+  "name": "pi-puppeteer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi extension package for browser-agnostic automation with Puppeteer-core, Chromium-first and Firefox-ready architecture.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "puppeteer",
+    "browser-automation",
+    "cdp",
+    "webdriver-bidi"
+  ],
+  "files": [
+    "src",
+    "docs",
+    "scripts/configure.ts",
+    "README.md",
+    "tsconfig.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "clean": "node -e \"const fs=require('node:fs'); for (const p of ['coverage','dist','build','tsconfig.tsbuildinfo']) fs.rmSync(p,{recursive:true,force:true});\"",
+    "build": "npm run check",
+    "check": "tsc --noEmit",
+    "validate": "npm run clean && npm run check",
+    "configure": "tsx scripts/configure.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.40.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.77.0",
+    "@earendil-works/pi-coding-agent": "0.77.0",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.22.3",
+    "typebox": "1.1.38",
+    "typescript": "^5.8.3"
+  }
+}
