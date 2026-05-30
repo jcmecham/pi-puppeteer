@@ -187,7 +187,18 @@ Initial inspect data:
 
 This is enough to support many agent workflows without flooding context.
 
-## 7. v1 scope
+## 7. Workflow model
+
+Saved workflows live under `.pi/.pi-puppeteer/workflows/` as canonical JSON plus generated Puppeteer scripts. The browser tool uses Puppeteer terminology: recorded flows are replayed with `workflow_replay`.
+
+Workflow recording combines two sources:
+
+- tool-level navigation steps emitted by the `browser` manager;
+- a page-injected recorder for clicks, form changes, special keys, submits, and scrolls.
+
+This keeps normal Pi tool actions and manual headed-browser interactions in the same workflow library. Replay executes the saved steps against the current tab when possible, or starts a browser session from the workflow metadata when no session is active.
+
+## 8. v1 scope
 
 ### In scope now
 
@@ -200,6 +211,8 @@ This is enough to support many agent workflows without flooding context.
 - core interaction actions
 - screenshot saving
 - MP4/WebM/GIF viewport recording via ffmpeg
+- saved workflow recording, listing, replay, rename, delete, and export
+- `/workflows` library UI
 - inspect / text extraction primitives
 
 ### Explicitly deferred
@@ -210,12 +223,12 @@ This is enough to support many agent workflows without flooding context.
 - raw CDP escape-hatch tooling
 - browser extension injection
 - advanced DOM replay / self-healing selectors
-- macro workflow language
+- Chrome DevTools Recorder import/export parity
 - OS-level browser chrome/window recording (current recording captures the page viewport)
 - remote/cloud browser providers
 - login/session import from personal browser profiles
 
-## 8. Firefox plan
+## 9. Firefox plan
 
 The current code structure should allow adding Firefox by implementing a dedicated adapter while keeping the same Pi tool contract.
 

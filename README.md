@@ -7,7 +7,7 @@ Pi extension package for browser automation with a browser-agnostic architecture
 - **Primary runtime:** `puppeteer-core`
 - **v1 focus:** Chrome, Edge, Brave, Opera, Vivaldi, and Yandex Browser via a shared Chromium adapter
 - **Connection modes:** launch a configured browser profile or attach to an existing Chromium debugging endpoint
-- **Tool surface:** one broad `browser` tool with core actions, inspect capabilities, screenshots, and ffmpeg-backed recordings
+- **Tool surface:** one broad `browser` tool for core browser control plus dedicated `workflow_list`, `workflow_replay`, and `workflow_details` tools for saved workflows
 - **Session model:** explicit session IDs and tab IDs
 - **Profile model:** named persistent profiles stored under `.pi/.pi-puppeteer/profiles/`
 
@@ -112,9 +112,14 @@ Example:
 
 ## Tool overview
 
-The extension exposes a single tool named `browser`.
+The extension exposes one broad browser control tool plus dedicated workflow execution tools:
 
-### Current actions
+- `browser` (navigation, interaction, inspect, screenshots, recordings, workflow recording management)
+- `workflow_list` (workflow summaries)
+- `workflow_replay` (replay a saved workflow)
+- `workflow_details` (full steps + raw browser-action fallback sequence)
+
+### Browser actions
 
 - `list_browsers`
 - `start`
@@ -136,6 +141,15 @@ The extension exposes a single tool named `browser`.
 - `screenshot`
 - `record_start`
 - `record_stop`
+- `workflow_record_start`
+- `workflow_record_stop`
+- `workflow_status`
+- `workflow_list`
+- `workflow_replay`
+- `workflow_details`
+- `workflow_rename`
+- `workflow_delete`
+- `workflow_export`
 
 ### Recording browsing clips
 
@@ -155,6 +169,34 @@ Notes:
 - Supported formats: `mp4`, `webm`, `gif`; format is inferred from `path` when possible.
 - Recording captures page content, not browser chrome/UI.
 
+### Recording and replaying workflows
+
+Workflows capture page-level interactions as replayable Puppeteer scripts. Start a workflow recording and pi-puppeteer will use the active browser session if one exists, or open the configured default browser for you. Interact with the page manually or through the `browser` tool, then stop the recorder:
+
+```json
+{ "action": "workflow_record_start", "workflowName": "login flow" }
+{ "action": "workflow_record_stop" }
+```
+
+Dedicated workflow tools for agents:
+
+```text
+workflow_list({})
+workflow_replay({ "workflowName": "login flow" })
+workflow_details({ "workflowName": "login flow" })
+```
+
+Saved workflow JSON and generated Puppeteer scripts live under `.pi/.pi-puppeteer/workflows/`. Use `/workflows` to open the workflow library UI for recording, replaying, renaming, exporting, and deleting saved workflows.
+
+Notes:
+
+- Workflow replay follows Puppeteer terminology: use `workflow_replay`, not `workflow_run`.
+- Preferred flow for agents: try `workflow_replay` first; if it fails, debug normally first, then use `workflow_details` raw actions only as a last resort.
+- While a workflow recording is active, Pi shows a footer status indicator and blocks starting a second workflow recording.
+- Recording covers page-level events such as navigation, clicks, form changes, special keys, submits, and scrolls.
+- Browser chrome, OS dialogs, native file pickers, and some cross-origin iframe or closed shadow-DOM interactions are outside the page recorder.
+- Password inputs are saved as `<redacted>`.
+
 ### Example prompts to Pi
 
 - “Start Chrome with profile `default` and open example.com.”
@@ -163,6 +205,8 @@ Notes:
 - “Inspect the current page and summarize headings, forms, and links.”
 - “Take a full-page screenshot and save it under artifacts/login.png.”
 - “Record a short GIF while you scroll through the page, then stop and save it.”
+- “Start a workflow recording named login, then replay it later.”
+- “Open `/workflows` and rename the checkout workflow.”
 
 ## Development checks
 

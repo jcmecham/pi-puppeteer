@@ -5,6 +5,7 @@ export type BrowserEngine = "chromium" | "firefox";
 export type SessionMode = "launch" | "attach";
 export type NavigationWaitUntil = "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 export type RecordingFormat = "mp4" | "webm" | "gif";
+export type ScriptFormat = "puppeteer" | "browser_tool";
 
 export type BrowserAction =
 	| "list_browsers"
@@ -26,7 +27,16 @@ export type BrowserAction =
 	| "inspect"
 	| "screenshot"
 	| "record_start"
-	| "record_stop";
+	| "record_stop"
+	| "workflow_record_start"
+	| "workflow_record_stop"
+	| "workflow_status"
+	| "workflow_list"
+	| "workflow_replay"
+	| "workflow_details"
+	| "workflow_rename"
+	| "workflow_delete"
+	| "workflow_export";
 
 export interface AttachConfig {
 	browserURL?: string;
@@ -106,6 +116,11 @@ export interface BrowserToolInput {
 	format?: RecordingFormat;
 	fps?: number;
 	ffmpegPath?: string;
+	workflowRecordingId?: string;
+	workflowId?: string;
+	workflowName?: string;
+	targetWorkflowName?: string;
+	scriptFormat?: ScriptFormat;
 }
 
 export interface PageRecord {
@@ -159,4 +174,48 @@ export interface RecordingRecord {
 	timer: NodeJS.Timeout;
 	stderr: string;
 	exitCode?: number | null;
+}
+
+export interface WorkflowRecordingRecord {
+	id: string;
+	name: string;
+	sessionId: string;
+	tabId: string;
+	page: Page;
+	browserKey: string;
+	profile?: string;
+	startedAt: number;
+	steps: WorkflowStep[];
+	lastChangeKey?: string;
+	lastScrollAt?: number;
+	active: boolean;
+}
+
+export type WorkflowStep =
+	| { type: "navigate"; url: string; timestamp?: number }
+	| { type: "click"; selectors: string[][]; button?: number; url?: string; timestamp?: number }
+	| { type: "change"; selectors: string[][]; value: string; url?: string; timestamp?: number }
+	| { type: "keyDown"; key: string; url?: string; timestamp?: number }
+	| { type: "scroll"; x: number; y: number; url?: string; timestamp?: number }
+	| { type: "submit"; selectors: string[][]; url?: string; timestamp?: number }
+	| { type: "waitForElement"; selectors: string[][]; timestamp?: number };
+
+export interface SavedWorkflow {
+	schemaVersion: 1;
+	id: string;
+	name: string;
+	createdAt: string;
+	updatedAt: string;
+	browserKey?: string;
+	profile?: string;
+	steps: WorkflowStep[];
+}
+
+export interface WorkflowSummary {
+	id: string;
+	name: string;
+	createdAt: string;
+	updatedAt: string;
+	stepCount: number;
+	startUrl: string | null;
 }

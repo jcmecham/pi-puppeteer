@@ -1,9 +1,26 @@
 import { spawn } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, extname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { Browser, Page } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
+import {
+	createWorkflowId,
+	deleteWorkflow,
+	findFirstSelector,
+	generateBrowserToolCalls,
+	generateBrowserToolScript,
+	generatePuppeteerScript,
+	injectedWorkflowRecorder,
+	listWorkflows,
+	readWorkflow,
+	renameWorkflow,
+	sanitizeWorkflowSegment,
+	summarizeWorkflow,
+	workflowRoot,
+	writeWorkflow,
+} from "./workflows.ts";
 import type {
 	BrowserSessionRecord,
 	BrowserToolInput,
@@ -11,7 +28,10 @@ import type {
 	RecordingFormat,
 	RecordingRecord,
 	ResolvedConfig,
+	SavedWorkflow,
 	SessionSummary,
+	WorkflowRecordingRecord,
+	WorkflowStep,
 } from "./types.ts";
 
 interface ToolResponse {
@@ -21,6 +41,7 @@ interface ToolResponse {
 
 const require = createRequire(import.meta.url);
 const bundledFfmpegPath = require("ffmpeg-static") as string | null;
+const WORKFLOW_RECORDER_FUNCTION = "__piPuppeteerWorkflowRecord";
 
 function truncate(value: string, max = 4000): string {
 	return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
@@ -34,9 +55,12 @@ function sanitizeSegment(value: string | undefined, fallback: string): string {
 export class BrowserManager {
 	private sessions = new Map<string, BrowserSessionRecord>();
 	private recordings = new Map<string, RecordingRecord>();
+	private workflowRecordings = new Map<string, WorkflowRecordingRecord>();
+	private workflowRecorderInjectedPages = new WeakSet<Page>();
 	private currentSessionId?: string;
 	private nextSessionNumber = 1;
 	private nextRecordingNumber = 1;
+	private nextWorkflowRecordingNumber = 1;
 
 	constructor(
 		private readonly cwd: string,
@@ -48,9 +72,13 @@ export class BrowserManager {
 	}
 
 	async closeAll(): Promise<void> {
+		for (const workflowRecording of [...this.workflowRecordings.values()]) {
+			await this.stopWorkflowRecording(workflowRecording).catch(() => undefined);
+		}
 		for (const session of [...this.sessions.values()]) {
 			await this.stopSession(session);
 		}
+		this.workflowRecordings.clear();
 		this.sessions.clear();
 		this.currentSessionId = undefined;
 	}
@@ -97,6 +125,24 @@ export class BrowserManager {
 				return this.recordStart(input);
 			case "record_stop":
 				return this.recordStop(input);
+			case "workflow_record_start":
+				return this.workflowRecordStart(input);
+			case "workflow_record_stop":
+				return this.workflowRecordStop(input);
+			case "workflow_status":
+				return this.workflowStatus();
+			case "workflow_list":
+				return this.workflowList();
+			case "workflow_replay":
+				return this.workflowReplay(input);
+			case "workflow_details":
+				return this.workflowDetails(input);
+			case "workflow_rename":
+				return this.workflowRename(input);
+			case "workflow_delete":
+				return this.workflowDelete(input);
+			case "workflow_export":
+				return this.workflowExport(input);
 			default:
 				throw new Error(`Unsupported browser action: ${String(input.action)}`);
 		}
@@ -174,6 +220,7 @@ export class BrowserManager {
 				waitUntil: input.waitUntil ?? this.config.defaults.navigationWaitUntil,
 				timeout: input.timeoutMs ?? this.config.defaults.timeoutMs,
 			});
+			this.recordWorkflowStep(session.id, session.currentPageId, { type: "navigate", url: currentPage.url(), timestamp: Date.now() });
 		}
 
 		return {
@@ -269,6 +316,9 @@ export class BrowserManager {
 		const tabs = await this.syncPages(session);
 		const created = tabs.find((tab) => session.pages.get(tab.id) === page);
 		if (created) session.currentPageId = created.id;
+		if (input.url) {
+			this.recordWorkflowStep(session.id, created?.id, { type: "navigate", url: page.url(), timestamp: Date.now() });
+		}
 		return {
 			text: `Created ${created?.id ?? "a new tab"}${input.url ? ` and opened ${input.url}` : ""}.`,
 			details: { action: "new_tab", sessionId: session.id, tab: created ?? null, tabs },
@@ -295,7 +345,10 @@ export class BrowserManager {
 		const session = this.resolveSession(input.sessionId);
 		const page = await this.resolvePage(session, input.tabId);
 		const closingId = input.tabId ?? session.currentPageId;
-		if (closingId) await this.stopSessionRecordings(session.id, closingId);
+		if (closingId) {
+			await this.stopSessionRecordings(session.id, closingId);
+			await this.stopSessionWorkflowRecordings(session.id, closingId);
+		}
 		await page.close();
 		const tabs = await this.syncPages(session);
 		return {
@@ -312,6 +365,7 @@ export class BrowserManager {
 			waitUntil: input.waitUntil ?? this.config.defaults.navigationWaitUntil,
 			timeout: input.timeoutMs ?? this.config.defaults.timeoutMs,
 		});
+		this.recordWorkflowStep(session.id, session.currentPageId, { type: "navigate", url: page.url(), timestamp: Date.now() });
 		return {
 			text: `Navigated ${session.id}/${session.currentPageId} to ${page.url()}.`,
 			details: {
@@ -611,6 +665,415 @@ export class BrowserManager {
 		};
 	}
 
+	private async workflowRecordStart(input: BrowserToolInput): Promise<ToolResponse> {
+		const activeRecording = [...this.workflowRecordings.values()].find((recording) => recording.active);
+		if (activeRecording) {
+			throw new Error(`Workflow recording '${activeRecording.name}' is already active as ${activeRecording.id}; stop it with workflow_record_stop before starting another.`);
+		}
+
+		let session: BrowserSessionRecord;
+		let openedSession = false;
+		try {
+			session = this.resolveSession(input.sessionId);
+		} catch (error) {
+			if (input.sessionId) throw error;
+			await this.start({
+				action: "start",
+				browserKey: input.browserKey,
+				profile: input.profile,
+				url: input.url,
+				headless: input.headless,
+				executablePath: input.executablePath,
+				waitUntil: input.waitUntil,
+				timeoutMs: input.timeoutMs,
+			});
+			session = this.resolveSession();
+			openedSession = true;
+		}
+		const page = await this.resolvePage(session, input.tabId);
+		const tabId = session.currentPageId;
+		if (!tabId) throw new Error("No tab is active to record a workflow.");
+
+		const name = input.workflowName?.trim() || `Workflow ${new Date().toLocaleString()}`;
+		const recordingNumber = this.nextWorkflowRecordingNumber++;
+		const recordingId = `workflow-recording-${recordingNumber}`;
+		const recording: WorkflowRecordingRecord = {
+			id: recordingId,
+			name,
+			sessionId: session.id,
+			tabId,
+			page,
+			browserKey: session.browserKey,
+			profile: session.profile,
+			startedAt: Date.now(),
+			steps: [],
+			active: true,
+		};
+
+		this.workflowRecordings.set(recording.id, recording);
+		await mkdir(this.workflowRoot(), { recursive: true });
+		await page.removeExposedFunction(WORKFLOW_RECORDER_FUNCTION).catch(() => undefined);
+		await page.exposeFunction(WORKFLOW_RECORDER_FUNCTION, (payload: Record<string, unknown>) => {
+			this.recordWorkflowBrowserEvent(recording.id, payload);
+		});
+		if (!this.workflowRecorderInjectedPages.has(page)) {
+			await page.evaluateOnNewDocument(injectedWorkflowRecorder, WORKFLOW_RECORDER_FUNCTION);
+			this.workflowRecorderInjectedPages.add(page);
+		}
+		await page.evaluate(injectedWorkflowRecorder, WORKFLOW_RECORDER_FUNCTION).catch(() => undefined);
+
+		const currentUrl = page.url();
+		if (currentUrl && currentUrl !== "about:blank") {
+			recording.steps.push({ type: "navigate", url: currentUrl, timestamp: Date.now() });
+		}
+
+		return {
+			text: `${openedSession ? `Started ${session.displayName} as ${session.id} and ` : ""}Started workflow recording ${recording.id} for ${session.id}/${tabId}. Interact with the page, then stop it with workflow_record_stop.`,
+			details: {
+				action: "workflow_record_start",
+				workflowRecordingId: recording.id,
+				name,
+				sessionId: session.id,
+				tabId,
+				activeRecording: {
+					id: recording.id,
+					name: recording.name,
+					sessionId: session.id,
+					tabId,
+					stepCount: recording.steps.length,
+					startedAt: recording.startedAt,
+				},
+			},
+		};
+	}
+
+	private async workflowRecordStop(input: BrowserToolInput): Promise<ToolResponse> {
+		const recording = this.resolveWorkflowRecording(input.workflowRecordingId, input.sessionId, input.tabId);
+		await this.stopWorkflowRecording(recording);
+		this.workflowRecordings.delete(recording.id);
+
+		const now = new Date().toISOString();
+		const workflow: SavedWorkflow = {
+			schemaVersion: 1,
+			id: createWorkflowId(input.workflowName?.trim() || recording.name),
+			name: input.workflowName?.trim() || recording.name,
+			createdAt: now,
+			updatedAt: now,
+			browserKey: recording.browserKey,
+			profile: recording.profile,
+			steps: recording.steps,
+		};
+		const saved = await writeWorkflow(this.workflowRoot(), workflow);
+		const elapsedMs = Date.now() - recording.startedAt;
+
+		return {
+			text: `Saved workflow '${workflow.name}' (${workflow.steps.length} steps, ${(elapsedMs / 1000).toFixed(1)}s) to ${this.displayPath(saved.jsonPath)}.\nGenerated Puppeteer script: ${this.displayPath(saved.scriptPath)}\n\n${truncate(saved.script, 10_000)}`,
+			details: {
+				action: "workflow_record_stop",
+				workflow: summarizeWorkflow(workflow),
+				jsonPath: saved.jsonPath,
+				scriptPath: saved.scriptPath,
+				stepCount: workflow.steps.length,
+			},
+		};
+	}
+
+	private workflowStatus(): ToolResponse {
+		const active = [...this.workflowRecordings.values()].map((recording) => ({
+			id: recording.id,
+			name: recording.name,
+			sessionId: recording.sessionId,
+			tabId: recording.tabId,
+			stepCount: recording.steps.length,
+			startedAt: recording.startedAt,
+			recentSteps: recording.steps.slice(-8),
+		}));
+		return {
+			text: active.length
+				? `Active workflow recordings:\n${active.map((item) => `${item.id}: ${item.name} (${item.stepCount} steps)`).join("\n")}`
+				: "No workflow recordings are active.",
+			details: { action: "workflow_status", active },
+		};
+	}
+
+	private async workflowList(): Promise<ToolResponse> {
+		const workflows = await listWorkflows(this.workflowRoot());
+		return {
+			text: workflows.length
+				? `Saved workflows:\n${workflows.map((workflow) => `${workflow.id}: ${workflow.name} (${workflow.stepCount} steps)`).join("\n")}`
+				: "No saved workflows.",
+			details: { action: "workflow_list", workflows },
+		};
+	}
+
+	private async workflowReplay(input: BrowserToolInput): Promise<ToolResponse> {
+		const workflow = await this.resolveWorkflow(input);
+		let session: BrowserSessionRecord;
+		try {
+			session = this.resolveSession(input.sessionId);
+		} catch {
+			await this.start({ action: "start", browserKey: input.browserKey ?? workflow.browserKey, profile: input.profile ?? workflow.profile, headless: input.headless });
+			session = this.resolveSession();
+		}
+		const page = await this.resolvePage(session, input.tabId);
+		for (const step of workflow.steps) {
+			await this.replayWorkflowStep(page, step, input.timeoutMs ?? this.config.defaults.timeoutMs);
+		}
+		return {
+			text: `Replayed workflow '${workflow.name}' (${workflow.steps.length} steps) in ${session.id}/${session.currentPageId}.`,
+			details: { action: "workflow_replay", workflow: summarizeWorkflow(workflow), sessionId: session.id, tabId: session.currentPageId },
+		};
+	}
+
+	private async workflowDetails(input: BrowserToolInput): Promise<ToolResponse> {
+		const workflow = await this.resolveWorkflow(input);
+		const calls = generateBrowserToolCalls(workflow);
+		const visitedUrls = [...new Set(workflow.steps
+			.flatMap((step) => {
+				if (step.type === "navigate") return [step.url];
+				if ("url" in step && typeof step.url === "string" && step.url) return [step.url];
+				return [] as string[];
+			})
+			.filter((url) => url && url !== "about:blank"))];
+		const urlSummary = visitedUrls.length
+			? `Visited URL${visitedUrls.length === 1 ? "" : "s"}:\n${visitedUrls.map((url, index) => `${index + 1}. ${url}`).join("\n")}`
+			: "Visited URL: not captured";
+
+		let currentUrl = "";
+		const callsWithContext = calls.map((call, index) => {
+			const step = workflow.steps[index];
+			const stepUrl = step
+				? (step.type === "navigate"
+					? step.url
+					: ("url" in step && typeof step.url === "string" ? step.url : undefined))
+				: undefined;
+			if (stepUrl && stepUrl !== "about:blank") currentUrl = stepUrl;
+			return {
+				index: index + 1,
+				url: currentUrl || null,
+				call,
+			};
+		});
+		const actionLines = callsWithContext.map((item) => `${item.index}. [${item.url ?? "url-not-captured"}] ${JSON.stringify(item.call)}`);
+
+		return {
+			text: `Workflow '${workflow.name}' has ${workflow.steps.length} steps.\n${urlSummary}\nRaw browser action fallback sequence (ordered with URL context):\n${truncate(actionLines.join("\n"), 10_000)}`,
+			details: {
+				action: "workflow_details",
+				workflow: summarizeWorkflow(workflow),
+				steps: workflow.steps,
+				calls,
+				callsWithContext,
+			},
+		};
+	}
+
+	private async workflowRename(input: BrowserToolInput): Promise<ToolResponse> {
+		if (!input.targetWorkflowName?.trim()) throw new Error("targetWorkflowName is required for workflow_rename.");
+		const workflow = await renameWorkflow(this.workflowRoot(), this.workflowIdentifier(input), input.targetWorkflowName);
+		return {
+			text: `Renamed workflow to '${workflow.name}' (${workflow.id}).`,
+			details: { action: "workflow_rename", workflow: summarizeWorkflow(workflow) },
+		};
+	}
+
+	private async workflowDelete(input: BrowserToolInput): Promise<ToolResponse> {
+		const workflow = await deleteWorkflow(this.workflowRoot(), this.workflowIdentifier(input));
+		return {
+			text: `Deleted workflow '${workflow.name}' (${workflow.id}).`,
+			details: { action: "workflow_delete", workflow: summarizeWorkflow(workflow) },
+		};
+	}
+
+	private async workflowExport(input: BrowserToolInput): Promise<ToolResponse> {
+		const workflow = await this.resolveWorkflow(input);
+		const format = input.scriptFormat ?? "puppeteer";
+		const script = format === "browser_tool" ? generateBrowserToolScript(workflow) : generatePuppeteerScript(workflow);
+		const defaultFileName = format === "browser_tool"
+			? `${sanitizeWorkflowSegment(workflow.id, "workflow")}.browser-tool.js`
+			: `${sanitizeWorkflowSegment(workflow.id, "workflow")}.js`;
+		const outputPath = input.path
+			? resolve(this.cwd, input.path)
+			: resolve(this.workflowRoot(), defaultFileName);
+		await mkdir(dirname(outputPath), { recursive: true });
+		await writeFile(outputPath, script, "utf8");
+		const fileUrl = pathToFileURL(outputPath).href;
+		return {
+			text: `Script exported to ${fileUrl}\nLocal path: ${outputPath}`,
+			details: { action: "workflow_export", workflow: summarizeWorkflow(workflow), format, path: outputPath, fileUrl, script },
+		};
+	}
+
+	private async replayWorkflowStep(page: Page, step: WorkflowStep, timeoutMs: number): Promise<void> {
+		await this.ensureWorkflowStepUrl(page, step, timeoutMs);
+		switch (step.type) {
+			case "navigate":
+				await page.goto(step.url, { waitUntil: this.config.defaults.navigationWaitUntil, timeout: timeoutMs });
+				return;
+			case "click":
+				await page.click(await findFirstSelector(page, step.selectors, timeoutMs));
+				await this.settleWorkflowStep(page, timeoutMs);
+				return;
+			case "change": {
+				const selector = await findFirstSelector(page, step.selectors, timeoutMs);
+				const editable = await page.$eval(selector, (node) => {
+					if (node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement) return true;
+					if (!(node instanceof HTMLInputElement)) return false;
+					return !["hidden", "button", "submit", "reset", "image", "file", "checkbox", "radio"].includes(node.type);
+				});
+				if (!editable) return;
+				await page.focus(selector);
+				await page.keyboard.down(process.platform === "darwin" ? "Meta" : "Control");
+				await page.keyboard.press("A");
+				await page.keyboard.up(process.platform === "darwin" ? "Meta" : "Control");
+				await page.keyboard.press("Backspace");
+				if (step.value && step.value !== "<redacted>") await page.type(selector, step.value);
+				return;
+			}
+			case "keyDown":
+				await page.keyboard.press(step.key as Parameters<typeof page.keyboard.press>[0]);
+				await this.settleWorkflowStep(page, timeoutMs);
+				return;
+			case "scroll":
+				await page.evaluate(({ x, y }) => window.scrollTo(x, y), { x: step.x, y: step.y });
+				return;
+			case "submit": {
+				const selector = await findFirstSelector(page, step.selectors, timeoutMs);
+				await page.$eval(selector, (node) => {
+					const form = node instanceof HTMLFormElement ? node : node.closest("form");
+					form?.requestSubmit();
+				});
+				await this.settleWorkflowStep(page, timeoutMs);
+				return;
+			}
+			case "waitForElement":
+				await page.waitForSelector(await findFirstSelector(page, step.selectors, timeoutMs), { timeout: timeoutMs });
+				return;
+		}
+	}
+
+	private async ensureWorkflowStepUrl(page: Page, step: WorkflowStep, timeoutMs: number): Promise<void> {
+		if (step.type === "navigate" || !("url" in step) || !step.url || step.url === "about:blank") return;
+		const currentUrl = page.url();
+		if (currentUrl === step.url) return;
+		if (currentUrl === "about:blank") {
+			await page.goto(step.url, { waitUntil: this.config.defaults.navigationWaitUntil, timeout: timeoutMs });
+			return;
+		}
+		try {
+			const current = new URL(currentUrl);
+			const target = new URL(step.url);
+			if (current.origin !== target.origin || current.pathname !== target.pathname) {
+				await page.goto(step.url, { waitUntil: this.config.defaults.navigationWaitUntil, timeout: timeoutMs });
+			}
+		} catch {
+			// Ignore non-standard URLs; selector lookup will surface a useful error if replay cannot continue.
+		}
+	}
+
+	private async settleWorkflowStep(page: Page, timeoutMs: number): Promise<void> {
+		await Promise.race([
+			page.waitForNavigation({ waitUntil: this.config.defaults.navigationWaitUntil, timeout: Math.min(timeoutMs, 5000) }).catch(() => undefined),
+			new Promise((resolve) => setTimeout(resolve, 250)),
+		]);
+	}
+
+	private recordWorkflowBrowserEvent(recordingId: string, payload: Record<string, unknown>): void {
+		const recording = this.workflowRecordings.get(recordingId);
+		if (!recording?.active) return;
+		const type = payload.type;
+		const timestamp = typeof payload.timestamp === "number" ? payload.timestamp : Date.now();
+		const url = typeof payload.url === "string" ? payload.url : undefined;
+		const selectors = this.normalizeWorkflowSelectors(payload.selectors);
+
+		if (type === "change" && selectors) {
+			const value = typeof payload.value === "string" ? payload.value : "";
+			const key = JSON.stringify(selectors);
+			const previous = recording.steps.at(-1);
+			if (previous?.type === "change" && recording.lastChangeKey === key) {
+				previous.value = value;
+				previous.timestamp = timestamp;
+				return;
+			}
+			recording.lastChangeKey = key;
+			recording.steps.push({ type: "change", selectors, value, url, timestamp });
+			return;
+		}
+
+		recording.lastChangeKey = undefined;
+		if (type === "click" && selectors) {
+			recording.steps.push({ type: "click", selectors, button: typeof payload.button === "number" ? payload.button : undefined, url, timestamp });
+			return;
+		}
+		if (type === "submit" && selectors) {
+			recording.steps.push({ type: "submit", selectors, url, timestamp });
+			return;
+		}
+		if (type === "keyDown" && typeof payload.key === "string") {
+			recording.steps.push({ type: "keyDown", key: payload.key, url, timestamp });
+			return;
+		}
+		if (type === "scroll" && typeof payload.x === "number" && typeof payload.y === "number") {
+			if (recording.lastScrollAt && timestamp - recording.lastScrollAt < 300) return;
+			recording.lastScrollAt = timestamp;
+			recording.steps.push({ type: "scroll", x: payload.x, y: payload.y, url, timestamp });
+		}
+	}
+
+	private recordWorkflowStep(sessionId: string, tabId: string | undefined, step: WorkflowStep): void {
+		if (!tabId) return;
+		for (const recording of this.workflowRecordings.values()) {
+			if (!recording.active || recording.sessionId !== sessionId || recording.tabId !== tabId) continue;
+			recording.lastChangeKey = undefined;
+			recording.steps.push(step);
+		}
+	}
+
+	private normalizeWorkflowSelectors(value: unknown): string[][] | undefined {
+		if (!Array.isArray(value)) return undefined;
+		const selectors = value
+			.filter((group): group is unknown[] => Array.isArray(group))
+			.map((group) => group.filter((selector): selector is string => typeof selector === "string" && selector.length > 0));
+		return selectors.length ? selectors : undefined;
+	}
+
+	private resolveWorkflowRecording(recordingId?: string, sessionId?: string, tabId?: string): WorkflowRecordingRecord {
+		if (recordingId) {
+			const recording = this.workflowRecordings.get(recordingId);
+			if (!recording) throw new Error(`Unknown workflow recording: ${recordingId}`);
+			return recording;
+		}
+		const candidates = [...this.workflowRecordings.values()].filter((recording) => {
+			if (!recording.active) return false;
+			if (sessionId && recording.sessionId !== sessionId) return false;
+			if (tabId && recording.tabId !== tabId) return false;
+			return true;
+		});
+		if (!candidates.length) throw new Error("No active workflow recording matched the requested session/tab.");
+		if (candidates.length > 1) throw new Error(`Multiple workflow recordings matched; pass workflowRecordingId (${candidates.map((recording) => recording.id).join(", ")}).`);
+		return candidates[0]!;
+	}
+
+	private async stopWorkflowRecording(recording: WorkflowRecordingRecord): Promise<void> {
+		recording.active = false;
+		if (recording.page.isClosed()) return;
+		await recording.page.removeExposedFunction(WORKFLOW_RECORDER_FUNCTION).catch(() => undefined);
+	}
+
+	private async resolveWorkflow(input: BrowserToolInput): Promise<SavedWorkflow> {
+		return readWorkflow(this.workflowRoot(), this.workflowIdentifier(input));
+	}
+
+	private workflowIdentifier(input: BrowserToolInput): string {
+		const identifier = input.workflowId ?? input.workflowName;
+		if (!identifier?.trim()) throw new Error("workflowId or workflowName is required.");
+		return identifier.trim();
+	}
+
+	private workflowRoot(): string {
+		return workflowRoot(this.config.artifactRoot);
+	}
+
 	private async registerSession(input: {
 		browser: Browser;
 		browserKey: string;
@@ -704,6 +1167,7 @@ export class BrowserManager {
 
 	private async stopSession(session: BrowserSessionRecord): Promise<void> {
 		await this.stopSessionRecordings(session.id);
+		await this.stopSessionWorkflowRecordings(session.id);
 		if (session.mode === "attach") {
 			session.browser.disconnect();
 			return;
@@ -806,6 +1270,18 @@ export class BrowserManager {
 		for (const recording of recordings) {
 			await this.stopRecording(recording).catch(() => undefined);
 			this.recordings.delete(recording.id);
+		}
+	}
+
+	private async stopSessionWorkflowRecordings(sessionId: string, tabId?: string): Promise<void> {
+		const recordings = [...this.workflowRecordings.values()].filter((recording) => {
+			if (recording.sessionId !== sessionId) return false;
+			if (tabId && recording.tabId !== tabId) return false;
+			return true;
+		});
+		for (const recording of recordings) {
+			await this.stopWorkflowRecording(recording).catch(() => undefined);
+			this.workflowRecordings.delete(recording.id);
 		}
 	}
 
