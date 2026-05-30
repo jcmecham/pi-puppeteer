@@ -16,7 +16,7 @@ const cwd = process.cwd();
 const config = loadConfig(cwd);
 const projectConfigPath = config.configPaths.project;
 
-const entries = Object.entries(config.browsers).map(([key, def]) => ({
+const browserEntries = Object.entries(config.browsers).map(([key, def]) => ({
 	key,
 	displayName: def.displayName,
 	engine: def.engine,
@@ -24,13 +24,29 @@ const entries = Object.entries(config.browsers).map(([key, def]) => ({
 	hasAttach: Boolean(def.attach),
 }));
 
+const entries = [
+	{
+		key: "system",
+		displayName: "System",
+		engine: "pi-puppeteer",
+		executablePath: undefined,
+		hasAttach: false,
+	},
+	...browserEntries,
+];
+
 function describe(entry: (typeof entries)[number]): string {
+	if (entry.key === "system") {
+		const current = config.defaultBrowserSetting === "system" ? " (current default)" : "";
+		return `System [${config.systemDefaultBrowser}] — OS default${current}`;
+	}
+
 	const status = entry.executablePath
 		? `found: ${entry.executablePath}`
 		: entry.hasAttach
 			? "attach only"
 			: "not found";
-	const current = entry.key === config.defaultBrowser ? " (current default)" : "";
+	const current = entry.key === config.defaultBrowserSetting ? " (current default)" : "";
 	return `${entry.displayName} [${entry.key}] — ${entry.engine}, ${status}${current}`;
 }
 
@@ -55,7 +71,7 @@ const argKey = process.argv[2];
 
 async function resolveSelection(): Promise<string | undefined> {
 	if (argKey) {
-		if (!config.browsers[argKey]) {
+		if (argKey !== "system" && !config.browsers[argKey]) {
 			print(`Unknown browser key: ${argKey}`);
 			return undefined;
 		}
@@ -85,8 +101,9 @@ if (!selected) {
 }
 
 await writeDefault(selected);
-print(`\nDefault browser set to '${selected}'.`);
+const resolved = selected === "system" ? ` (resolves to '${config.systemDefaultBrowser}')` : "";
+print(`\nDefault browser set to '${selected}'${resolved}.`);
 print(`Wrote ${join(".pi", ".pi-puppeteer", "settings.json")} (defaultBrowser: "${selected}").`);
-if (!config.browsers[selected]?.executablePath && !config.browsers[selected]?.attach) {
+if (selected !== "system" && !config.browsers[selected]?.executablePath && !config.browsers[selected]?.attach) {
 	print(`Note: '${selected}' was not discovered on this machine — set its executablePath or attach endpoint in the config.`);
 }

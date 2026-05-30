@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync } from "node:fs";
 import os from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
@@ -17,6 +18,9 @@ const DEFAULTS: ExtensionDefaults = {
 	navigationWaitUntil: "domcontentloaded",
 };
 
+const BUILT_IN_DEFAULT_BROWSER = "chrome";
+const SYSTEM_DEFAULT_SETTING = "system";
+
 const DEFAULT_GLOBAL_CONFIG = join(getAgentDir(), "extensions", "pi-puppeteer.json");
 const LEGACY_PROJECT_CONFIGS = [".pi/pi-puppeteer.json", ".pi/.pi-puppeteer/pi-puppeteer.json"];
 const PROJECT_CONFIG = ".pi/.pi-puppeteer/settings.json";
@@ -29,6 +33,78 @@ const DEFAULT_ARTIFACT_ROOT = ".pi/.pi-puppeteer/artifacts";
 
 function unique(values: Array<string | undefined>): string[] {
 	return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+function runQuiet(command: string, args: string[]): string | undefined {
+	try {
+		return execFileSync(command, args, {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			windowsHide: true,
+		}).trim();
+	} catch {
+		return undefined;
+	}
+}
+
+function readWindowsRegistryValue(key: string, valueName: string): string | undefined {
+	const args = valueName ? ["query", key, "/v", valueName] : ["query", key, "/ve"];
+	const output = runQuiet("reg", args);
+	const line = output?.split(/\r?\n/).find((candidate) => /\bREG_(?:SZ|EXPAND_SZ)\b/.test(candidate));
+	return line?.match(/\bREG_(?:SZ|EXPAND_SZ)\b\s+(.+)$/)?.[1]?.trim();
+}
+
+function mapBrowserIdentifier(value: string | undefined): string | undefined {
+	const normalized = value?.toLowerCase() ?? "";
+	if (!normalized) return undefined;
+	if (normalized.includes("brave")) return "brave";
+	if (normalized.includes("msedge") || normalized.includes("microsoft-edge") || normalized.includes("edge")) return "edge";
+	if (normalized.includes("firefox") || normalized.includes("mozilla")) return "firefox";
+	if (normalized.includes("opera")) return "opera";
+	if (normalized.includes("vivaldi")) return "vivaldi";
+	if (normalized.includes("yandex")) return "yandex";
+	if (normalized.includes("chrome") || normalized.includes("chromium")) return "chrome";
+	return undefined;
+}
+
+function windowsDefaultBrowserKey(): string | undefined {
+	for (const scheme of ["https", "http"]) {
+		const progId = readWindowsRegistryValue(
+			`HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\${scheme}\\UserChoice`,
+			"ProgId",
+		);
+		const fromProgId = mapBrowserIdentifier(progId);
+		if (fromProgId) return fromProgId;
+
+		if (progId) {
+			const openCommand =
+				readWindowsRegistryValue(`HKCU\\Software\\Classes\\${progId}\\shell\\open\\command`, "") ??
+				readWindowsRegistryValue(`HKCR\\${progId}\\shell\\open\\command`, "");
+			const fromCommand = mapBrowserIdentifier(openCommand);
+			if (fromCommand) return fromCommand;
+		}
+	}
+	return undefined;
+}
+
+function macDefaultBrowserKey(): string | undefined {
+	const bundleId = runQuiet("osascript", ["-e", "id of application (path to default application for url \"https://example.com\")"]);
+	return mapBrowserIdentifier(bundleId);
+}
+
+function linuxDefaultBrowserKey(): string | undefined {
+	const desktopFile =
+		runQuiet("xdg-settings", ["get", "default-web-browser"]) ??
+		runQuiet("xdg-mime", ["query", "default", "x-scheme-handler/https"]) ??
+		runQuiet("xdg-mime", ["query", "default", "x-scheme-handler/http"]);
+	return mapBrowserIdentifier(desktopFile);
+}
+
+function detectSystemDefaultBrowserKey(): string | undefined {
+	if (process.platform === "win32") return windowsDefaultBrowserKey();
+	if (process.platform === "darwin") return macDefaultBrowserKey();
+	if (process.platform === "linux") return linuxDefaultBrowserKey();
+	return undefined;
 }
 
 function pathCandidates(commands: string[]): string[] {
@@ -420,12 +496,19 @@ export function loadConfig(cwd: string): ResolvedConfig {
 		}
 	}
 
-	const defaultBrowser = projectConfig.defaultBrowser ?? globalConfig.defaultBrowser ?? "chrome";
+	const defaultBrowserSetting = projectConfig.defaultBrowser ?? globalConfig.defaultBrowser ?? SYSTEM_DEFAULT_SETTING;
+	const detectedSystemDefaultBrowser = detectSystemDefaultBrowserKey();
+	const systemDefaultBrowser = detectedSystemDefaultBrowser && mergedBrowsers[detectedSystemDefaultBrowser]
+		? detectedSystemDefaultBrowser
+		: BUILT_IN_DEFAULT_BROWSER;
+	const defaultBrowser = defaultBrowserSetting === SYSTEM_DEFAULT_SETTING ? systemDefaultBrowser : defaultBrowserSetting;
 	const profileRoot = resolveStorageRoot(cwd, projectConfig.profileRoot ?? globalConfig.profileRoot, LEGACY_PROFILE_ROOT, DEFAULT_PROFILE_ROOT);
 	const artifactRoot = resolveStorageRoot(cwd, projectConfig.artifactRoot ?? globalConfig.artifactRoot, LEGACY_ARTIFACT_ROOT, DEFAULT_ARTIFACT_ROOT);
 
 	return {
 		defaultBrowser,
+		defaultBrowserSetting,
+		systemDefaultBrowser,
 		profileRoot,
 		artifactRoot,
 		defaults: mergedDefaults,

@@ -112,6 +112,8 @@ export class BrowserManager {
 			details: {
 				action: "list_browsers",
 				defaultBrowser: this.config.defaultBrowser,
+				defaultBrowserSetting: this.config.defaultBrowserSetting,
+				systemDefaultBrowser: this.config.systemDefaultBrowser,
 				configPaths: this.config.configPaths,
 				browsers,
 			},
@@ -119,7 +121,7 @@ export class BrowserManager {
 	}
 
 	private async start(input: BrowserToolInput): Promise<ToolResponse> {
-		const browserKey = input.browserKey ?? this.config.defaultBrowser;
+		const browserKey = this.resolveBrowserKey(input.browserKey);
 		const definition = this.config.browsers[browserKey];
 		if (!definition) {
 			throw new Error(`Unknown browser key: ${browserKey}`);
@@ -173,7 +175,7 @@ export class BrowserManager {
 	}
 
 	private async attach(input: BrowserToolInput): Promise<ToolResponse> {
-		const browserKey = input.browserKey ?? this.config.defaultBrowser;
+		const browserKey = this.resolveBrowserKey(input.browserKey);
 		const definition = this.config.browsers[browserKey];
 		if (!definition) {
 			throw new Error(`Unknown browser key: ${browserKey}`);
@@ -559,6 +561,11 @@ export class BrowserManager {
 				current: id === session.currentPageId,
 			})),
 		);
+	}
+
+	private resolveBrowserKey(browserKey?: string): string {
+		if (!browserKey) return this.config.defaultBrowser;
+		return browserKey === "system" ? this.config.systemDefaultBrowser : browserKey;
 	}
 
 	private resolveSession(sessionId?: string): BrowserSessionRecord {

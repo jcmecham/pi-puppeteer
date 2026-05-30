@@ -67,19 +67,21 @@ Project config, persistent profiles, and artifacts live under `<cwd>/.pi/.pi-pup
 
 ### Choose the default browser
 
-Run the interactive picker to see which browsers were discovered on this machine and
-select the default. It writes `defaultBrowser` to `.pi/.pi-puppeteer/settings.json`:
+Fresh installs use `defaultBrowser: "system"`, which means the detected operating-system default browser. On Windows, this reads the per-user `UrlAssociations\\http(s)\\UserChoice` ProgID (for example, `BraveHTML` resolves to `brave`). If detection is unavailable or unsupported, it falls back to Chrome.
+
+Run the interactive picker to keep `system` or choose a discovered browser. It writes `defaultBrowser` to `.pi/.pi-puppeteer/settings.json`:
 
 ```bash
-npm run configure          # interactive menu
-npm run configure -- edge  # set non-interactively
+npm run configure             # interactive menu
+npm run configure -- system   # use the OS default browser
+npm run configure -- edge     # set non-interactively
 ```
 
 Example:
 
 ```json
 {
-  "defaultBrowser": "chrome",
+  "defaultBrowser": "system",
   "profileRoot": ".pi/.pi-puppeteer/profiles",
   "artifactRoot": ".pi/.pi-puppeteer/artifacts",
   "defaults": {

@@ -19,9 +19,14 @@ async function writeProjectDefaultBrowser(config: ResolvedConfig, browserKey: st
 	await writeFile(projectConfigPath, `${JSON.stringify(existing, null, 2)}\n`, "utf8");
 }
 
-function browserOptionLabel(key: string, definition: ResolvedConfig["browsers"][string], currentDefault: string): string {
-	const current = key === currentDefault ? " (current)" : "";
+function browserOptionLabel(key: string, definition: ResolvedConfig["browsers"][string], currentSetting: string): string {
+	const current = key === currentSetting ? " (current)" : "";
 	return `${definition.displayName} [${key}] — ${definition.engine}${current}`;
+}
+
+function systemOptionLabel(config: ResolvedConfig): string {
+	const current = config.defaultBrowserSetting === "system" ? " (current)" : "";
+	return `System [${config.systemDefaultBrowser}] — OS default${current}`;
 }
 
 const BrowserToolSchema = Type.Object({
@@ -47,7 +52,7 @@ const BrowserToolSchema = Type.Object({
 			"screenshot",
 		] as const,
 	),
-	browserKey: Type.Optional(Type.String({ description: "Configured browser key, like chrome or edge" })),
+	browserKey: Type.Optional(Type.String({ description: "Configured browser key, like chrome or edge; use system for the detected OS default browser" })),
 	sessionId: Type.Optional(Type.String({ description: "Browser session ID, like session-1" })),
 	tabId: Type.Optional(Type.String({ description: "Tab ID, like tab-1" })),
 	profile: Type.Optional(Type.String({ description: "Named profile for launch mode" })),
@@ -86,33 +91,37 @@ export default function (pi: ExtensionAPI) {
 			const config = loadConfig(ctx.cwd);
 			const detected = Object.entries(config.browsers).filter(([, definition]) => Boolean(definition.executablePath));
 
-			if (!detected.length) {
-				ctx.ui.notify("No browser executables were detected. Configure executablePath in .pi/.pi-puppeteer/settings.json.", "warning");
-				return;
-			}
-
 			let selectedKey = args.trim();
 			if (selectedKey) {
-				const selected = config.browsers[selectedKey];
-				if (!selected) {
-					ctx.ui.notify(`Unknown browser key: ${selectedKey}`, "error");
-					return;
-				}
-				if (!selected.executablePath) {
-					ctx.ui.notify(`Browser '${selectedKey}' was not detected on this machine.`, "error");
-					return;
+				if (selectedKey !== "system") {
+					const selected = config.browsers[selectedKey];
+					if (!selected) {
+						ctx.ui.notify(`Unknown browser key: ${selectedKey}`, "error");
+						return;
+					}
+					if (!selected.executablePath) {
+						ctx.ui.notify(`Browser '${selectedKey}' was not detected on this machine.`, "error");
+						return;
+					}
 				}
 			} else {
-				const labels = detected.map(([key, definition]) => browserOptionLabel(key, definition, config.defaultBrowser));
-				const choice = await ctx.ui.select("Select default browser:", labels);
+				const options = [
+					{ key: "system", label: systemOptionLabel(config) },
+					...detected.map(([key, definition]) => ({
+						key,
+						label: browserOptionLabel(key, definition, config.defaultBrowserSetting),
+					})),
+				];
+				const choice = await ctx.ui.select("Select default browser:", options.map((option) => option.label));
 				if (!choice) return;
-				selectedKey = detected[labels.indexOf(choice)]![0];
+				selectedKey = options.find((option) => option.label === choice)!.key;
 			}
 
 			await writeProjectDefaultBrowser(config, selectedKey);
 			const nextConfig = loadConfig(ctx.cwd);
 			manager?.setConfig(nextConfig);
-			ctx.ui.notify(`Default browser set to '${selectedKey}'.`, "info");
+			const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
+			ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
 		},
 	});
 

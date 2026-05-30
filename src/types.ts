@@ -62,7 +62,12 @@ export interface RawExtensionConfig {
 }
 
 export interface ResolvedConfig {
+	/** Resolved browser key used by tools. "system" resolves to the OS default browser when supported. */
 	defaultBrowser: string;
+	/** Raw default browser setting after config precedence; "system" means use the OS default browser. */
+	defaultBrowserSetting: string;
+	/** Detected OS default browser key, or the built-in fallback when detection is unsupported. */
+	systemDefaultBrowser: string;
 	profileRoot: string;
 	artifactRoot: string;
 	defaults: ExtensionDefaults;
