@@ -12,6 +12,7 @@ export type BrowserAction =
 	| "start"
 	| "attach"
 	| "sessions"
+	| "select_session"
 	| "stop"
 	| "tabs"
 	| "new_tab"
@@ -140,6 +141,11 @@ export interface SessionSummary {
 	current: boolean;
 	currentTabId?: string;
 	tabCount: number;
+	createdAt: number;
+	lastActiveAt: number;
+	currentUrl?: string;
+	currentTitle?: string;
+	tabs: PageRecord[];
 }
 
 export interface BrowserSessionRecord {
@@ -154,6 +160,7 @@ export interface BrowserSessionRecord {
 	currentPageId?: string;
 	nextTabNumber: number;
 	createdAt: number;
+	lastActiveAt: number;
 	// Teardown for launch-mode sessions; undefined for attach-mode sessions.
 	dispose?: () => Promise<void>;
 }

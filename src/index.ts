@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { BrowserManager } from "./manager.ts";
-import type { BrowserToolInput, RawExtensionConfig, ResolvedConfig, WorkflowStep } from "./types.ts";
+import type { BrowserToolInput, RawExtensionConfig, ResolvedConfig, SessionSummary, WorkflowStep } from "./types.ts";
 
 async function writeProjectDefaultBrowser(config: ResolvedConfig, browserKey: string): Promise<void> {
 	const projectConfigPath = config.configPaths.project;
@@ -62,8 +62,16 @@ type WorkflowLibraryAction =
 	| { type: "export"; workflow: SavedWorkflowSummary }
 	| { type: "delete"; workflow: SavedWorkflowSummary };
 
+type SessionManagerAction =
+	| { type: "exit" }
+	| { type: "create" }
+	| { type: "activate"; session: SessionSummary }
+	| { type: "close"; session: SessionSummary };
+
 const WORKFLOW_RECORDING_WIDGET_KEY = "pi-puppeteer-workflow-recording";
 const WORKFLOW_RECORDING_STATUS_KEY = "pi-puppeteer-workflow";
+const BROWSER_SESSIONS_STATUS_KEY = "pi-puppeteer-sessions";
+const BROWSER_SESSIONS_WIDGET_KEY = "pi-puppeteer-sessions-widget";
 
 function recordingDot(ctx: WorkflowStatusUiContext, lit = true): string {
 	return ctx.ui.theme.fg(lit ? "error" : "dim", lit ? "●" : "○");
@@ -531,6 +539,316 @@ class WorkflowRecordingUiController {
 	}
 }
 
+function formatRelativeTime(timestamp?: number): string {
+	if (!timestamp) return "just now";
+	const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+	if (seconds < 5) return "just now";
+	if (seconds < 60) return `${seconds}s ago`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h ago`;
+	const days = Math.floor(hours / 24);
+	return `${days}d ago`;
+}
+
+function compactUrl(url?: string): string {
+	if (!url) return "(no URL)";
+	try {
+		const parsed = new URL(url);
+		const compact = `${parsed.host}${parsed.pathname === "/" ? "" : parsed.pathname}${parsed.search}`;
+		return compact || url;
+	} catch {
+		return url;
+	}
+}
+
+function setBrowserSessionsStatus(ctx: WorkflowStatusUiContext, count: number): void {
+	ctx.ui.setStatus(BROWSER_SESSIONS_STATUS_KEY, undefined);
+	if (count <= 0) {
+		ctx.ui.setWidget?.(BROWSER_SESSIONS_WIDGET_KEY, undefined);
+		return;
+	}
+	if (!ctx.ui.setWidget) {
+		const label = ctx.ui.theme.fg("accent", count === 1 ? "Browser Session" : "Browser Sessions");
+		const total = ctx.ui.theme.fg("text", `: ${count}`);
+		const hint = ctx.ui.theme.fg("dim", " [Alt+P]");
+		ctx.ui.setStatus(BROWSER_SESSIONS_STATUS_KEY, `${label}${total}${hint}`);
+		return;
+	}
+	const widgetFactory = ((_tui: any, theme: any) => ({
+		render(width: number): string[] {
+			const label = theme.fg("accent", count === 1 ? "Browser Session" : "Browser Sessions");
+			const total = theme.fg("text", `: ${count}`);
+			const hint = theme.fg("dim", " [Alt+P]");
+			return [joinColumns("", `${label}${total}${hint}`, width)];
+		},
+		invalidate(): void {},
+	})) as any;
+	ctx.ui.setWidget(BROWSER_SESSIONS_WIDGET_KEY, widgetFactory, { placement: "aboveEditor" });
+}
+
+async function showBrowserSessionsScreen(
+	ctx: ExtensionCommandContext | ExtensionContext,
+	sessions: SessionSummary[],
+	preferredSessionId?: string,
+): Promise<SessionManagerAction> {
+	let selectedIndex = Math.max(0, sessions.findIndex((session) => session.id === preferredSessionId || (!preferredSessionId && session.current)));
+	let closeArmed = false;
+	let requestRender: (() => void) | undefined;
+	let component: RecordingScreenComponent | undefined;
+
+	return ctx.ui.custom<SessionManagerAction>((tui, theme, _keybindings, done) => {
+		requestRender = () => tui.requestRender();
+		component = {
+			render(width: number): string[] {
+				const minWidth = Math.max(24, width);
+				const innerWidth = Math.max(1, minWidth - 4);
+				const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
+				const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
+				const boxed = (content: string) => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
+				const selected = sessions[selectedIndex];
+				const lines = [
+					border("╭", "─", "╮"),
+					boxed(theme.fg("text", bold("Browser Manager"))),
+					boxed(theme.fg("muted", sessions.length ? "Choose which browser Pi should use by default." : "No browser sessions are open.")),
+					boxed(""),
+				];
+
+				if (!sessions.length) {
+					lines.push(boxed(theme.fg("muted", `Press ${workflowKeycap(theme, "N", "accent")} to open the default browser.`)));
+				} else {
+					const maxVisible = 4;
+					const visibleCount = Math.min(maxVisible, sessions.length);
+					const start = Math.max(0, Math.min(selectedIndex - Math.floor(visibleCount / 2), sessions.length - visibleCount));
+					const end = start + visibleCount;
+					lines.push(boxed(theme.fg("dim", "Open browsers")));
+					if (start > 0) lines.push(boxed(theme.fg("dim", `  … ${start} earlier`)));
+					for (let index = start; index < end; index += 1) {
+						const session = sessions[index]!;
+						const prefix = index === selectedIndex ? theme.fg("accent", "→ ") : "  ";
+						const scope = session.mode === "launch" ? `profile ${session.profile ?? "default"}` : "attached browser";
+						const metaBits = [session.id, `${session.tabCount} tab${session.tabCount === 1 ? "" : "s"}`];
+						if (session.current) metaBits.push("used by default");
+						lines.push(boxed(`${prefix}${theme.fg(index === selectedIndex ? "accent" : "text", `${session.displayName} · ${scope}`)}`));
+						lines.push(boxed(`   ${theme.fg("muted", metaBits.join(" · "))}`));
+					}
+					if (end < sessions.length) lines.push(boxed(theme.fg("dim", `  … ${sessions.length - end} more`)));
+
+					if (selected) {
+						const currentTab = selected.tabs.find((tab) => tab.current) ?? selected.tabs[0];
+						const currentTitle = currentTab ? currentTab.title || compactUrl(currentTab.url) || "(untitled)" : "No tabs open";
+						const currentUrl = currentTab ? compactUrl(currentTab.url) : "";
+						const extraTabs = Math.max(0, selected.tabCount - (currentTab ? 1 : 0));
+						lines.push(
+							boxed(""),
+							boxed(theme.fg("dim", "Selected browser")),
+							boxed(theme.fg("muted", selected.current ? "Browser commands use this session by default." : `Press ${workflowKeycap(theme, "Enter", "accent")} to use this session by default.`)),
+							boxed(`${theme.fg("text", "Browser:")} ${selected.displayName}`),
+							boxed(`${theme.fg("text", "Source:")} ${selected.mode === "launch" ? `profile ${selected.profile ?? "default"}` : "attached browser"}`),
+							boxed(`${theme.fg("text", "Session:")} ${selected.id}`),
+							boxed(`${theme.fg("text", "Current tab:")} ${currentTitle}`),
+						);
+						if (currentUrl && currentUrl !== currentTitle) {
+							lines.push(boxed(theme.fg("muted", currentUrl)));
+						}
+						if (extraTabs > 0) {
+							lines.push(boxed(theme.fg("dim", `${extraTabs} more open tab${extraTabs === 1 ? "" : "s"}`)));
+						}
+					}
+				}
+
+				const stopActionLabel = selected?.mode === "attach" ? "Detach" : "Close";
+				const confirmStopActionLabel = selected?.mode === "attach" ? "Confirm detach" : "Confirm close";
+				const controls = !sessions.length
+					? [
+						`${workflowKeycap(theme, "N", "accent")} Open browser`,
+						`${workflowKeycap(theme, "Esc")} Back`,
+					].join(theme.fg("dim", "  ·  "))
+					: closeArmed
+						? [
+							`${workflowKeycap(theme, "D", "warning")} ${confirmStopActionLabel}`,
+							`${workflowKeycap(theme, "Esc")} Cancel`,
+						].join(theme.fg("dim", "  ·  "))
+						: [
+							`${workflowKeycap(theme, "↑↓")} Move`,
+							`${workflowKeycap(theme, "Enter", "accent")} ${selected?.current ? "Focus" : "Use by default"}`,
+							`${workflowKeycap(theme, "N", "accent")} Open profile`,
+							`${workflowKeycap(theme, "D", "accent")} ${stopActionLabel}`,
+							`${workflowKeycap(theme, "Esc")} Back`,
+						].join(theme.fg("dim", "  ·  "));
+				lines.push(
+					boxed(""),
+					boxed(controls),
+					border("╰", "─", "╯"),
+				);
+				return lines.map((line) => truncateAnsi(line, width));
+			},
+			invalidate(): void {},
+			handleInput(data: string): void {
+				const selected = sessions[selectedIndex];
+				if (data === "n" || data === "N") {
+					done({ type: "create" });
+					return;
+				}
+				if (data === "\x1b[A") {
+					if (!sessions.length) return;
+					selectedIndex = Math.max(0, selectedIndex - 1);
+					closeArmed = false;
+					requestRender?.();
+					return;
+				}
+				if (data === "\x1b[B") {
+					if (!sessions.length) return;
+					selectedIndex = Math.min(sessions.length - 1, selectedIndex + 1);
+					closeArmed = false;
+					requestRender?.();
+					return;
+				}
+				if (data === "\x1b" || data === "\x03") {
+					if (closeArmed) {
+						closeArmed = false;
+						requestRender?.();
+						return;
+					}
+					done({ type: "exit" });
+					return;
+				}
+				if (!selected) return;
+				if (data === "\r" || data === "\n") {
+					done({ type: "activate", session: selected });
+					return;
+				}
+				if (data === "d" || data === "D") {
+					if (closeArmed) {
+						done({ type: "close", session: selected });
+						return;
+					}
+					closeArmed = true;
+					requestRender?.();
+				}
+			},
+		};
+		return component;
+	}).finally(() => {
+		component = undefined;
+		requestRender = undefined;
+	});
+}
+
+async function openBrowserSessionsManager(
+	ctx: ExtensionCommandContext | ExtensionContext,
+	browserManager: BrowserManager,
+	onChange?: () => Promise<void>,
+): Promise<void> {
+	let selectedSessionId: string | undefined;
+	while (true) {
+		const result = await browserManager.execute({ action: "sessions" });
+		const sessions = ((result.details.sessions as SessionSummary[] | undefined) ?? []);
+		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId);
+		if (action.type === "exit") return;
+		if (action.type !== "create") selectedSessionId = action.session.id;
+		try {
+			if (action.type === "create") {
+				let profile: string | undefined;
+				if (sessions.length) {
+					const suggestedProfile = `profile-${sessions.length + 1}`;
+					const enteredProfile = await ctx.ui.input("Profile name for the new browser session:", suggestedProfile);
+					if (!enteredProfile) continue;
+					const trimmedProfile = enteredProfile.trim();
+					if (!trimmedProfile) {
+						ctx.ui.notify("Profile name cannot be blank.", "error");
+						continue;
+					}
+					profile = trimmedProfile;
+				}
+				const started = await browserManager.execute({ action: "start", ...(profile ? { profile } : {}) });
+				const session = started.details.session as SessionSummary | undefined;
+				selectedSessionId = session?.id;
+				ctx.ui.notify(started.text, "info");
+			} else if (action.type === "activate") {
+				const wasDefault = action.session.current;
+				await browserManager.execute({ action: "select_session", sessionId: action.session.id });
+				ctx.ui.notify(wasDefault ? `Focused ${action.session.id}.` : `Default session set to ${action.session.id}.`, "info");
+			} else if (action.type === "close") {
+				const stopped = await browserManager.execute({ action: "stop", sessionId: action.session.id });
+				ctx.ui.notify(stopped.text, "info");
+			}
+		} catch (error) {
+			ctx.ui.notify((error as Error).message, "error");
+		}
+		await onChange?.();
+	}
+}
+
+class BrowserSessionsUiController {
+	private refreshTimer: NodeJS.Timeout | undefined;
+	private terminalInputUnsubscribe: (() => void) | undefined;
+	private refreshing = false;
+	private opening = false;
+	private sessionCount = 0;
+
+	constructor(
+		private readonly ctx: ExtensionContext,
+		private readonly getManager: () => BrowserManager,
+	) {
+		this.terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => this.handleTerminalInput(data));
+		this.ensureRefreshTimer();
+	}
+
+	dispose(): void {
+		if (this.refreshTimer) {
+			clearInterval(this.refreshTimer);
+			this.refreshTimer = undefined;
+		}
+		setBrowserSessionsStatus(this.ctx, 0);
+		this.terminalInputUnsubscribe?.();
+		this.terminalInputUnsubscribe = undefined;
+	}
+
+	async refreshNow(): Promise<void> {
+		if (this.refreshing) return;
+		this.refreshing = true;
+		try {
+			const result = await this.getManager().execute({ action: "sessions" });
+			const sessions = ((result.details.sessions as SessionSummary[] | undefined) ?? []);
+			this.sessionCount = sessions.length;
+			if (!this.opening) setBrowserSessionsStatus(this.ctx, this.sessionCount);
+		} catch {
+			this.sessionCount = 0;
+			if (!this.opening) setBrowserSessionsStatus(this.ctx, 0);
+		} finally {
+			this.refreshing = false;
+		}
+	}
+
+	async open(): Promise<void> {
+		if (this.opening) return;
+		this.opening = true;
+		try {
+			await openBrowserSessionsManager(this.ctx, this.getManager(), async () => {
+				await this.refreshNow();
+			});
+		} finally {
+			this.opening = false;
+			await this.refreshNow();
+		}
+	}
+
+	private ensureRefreshTimer(): void {
+		if (this.refreshTimer) return;
+		this.refreshTimer = setInterval(() => void this.refreshNow(), 1500);
+	}
+
+	private handleTerminalInput(data: string): { consume?: boolean; data?: string } | undefined {
+		if (data === "\x1bp" || data === "\x1bP") {
+			void this.open();
+			return { consume: true };
+		}
+		return undefined;
+	}
+}
+
 const BrowserToolSchema = Type.Object({
 	action: StringEnum(
 		[
@@ -538,6 +856,7 @@ const BrowserToolSchema = Type.Object({
 			"start",
 			"attach",
 			"sessions",
+			"select_session",
 			"stop",
 			"tabs",
 			"new_tab",
@@ -615,6 +934,7 @@ const WorkflowDetailsToolSchema = Type.Object({
 export default function (pi: ExtensionAPI) {
 	let manager: BrowserManager | undefined;
 	let workflowUi: WorkflowRecordingUiController | undefined;
+	let sessionsUi: BrowserSessionsUiController | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
 		manager = new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
@@ -622,11 +942,18 @@ export default function (pi: ExtensionAPI) {
 			manager ??= new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
 			return manager;
 		});
+		sessionsUi = new BrowserSessionsUiController(ctx, () => {
+			manager ??= new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
+			return manager;
+		});
+		await sessionsUi.refreshNow();
 	});
 
 	pi.on("session_shutdown", async () => {
 		workflowUi?.dispose();
 		workflowUi = undefined;
+		sessionsUi?.dispose();
+		sessionsUi = undefined;
 		if (!manager) return;
 		await manager.closeAll();
 		manager = undefined;
@@ -669,6 +996,16 @@ export default function (pi: ExtensionAPI) {
 			manager?.setConfig(nextConfig);
 			const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
 			ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
+		},
+	});
+
+	pi.registerCommand("browser", {
+		description: "Open the browser manager",
+		handler: async (_args, ctx) => {
+			manager ??= new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
+			await openBrowserSessionsManager(ctx, manager, async () => {
+				await sessionsUi?.refreshNow();
+			});
 		},
 	});
 
@@ -733,6 +1070,8 @@ export default function (pi: ExtensionAPI) {
 					}
 				} catch (error) {
 					ctx.ui.notify((error as Error).message, "error");
+				} finally {
+					await sessionsUi?.refreshNow();
 				}
 			}
 		},
@@ -745,7 +1084,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Launch or attach to configured browsers, navigate pages, inspect page state, capture screenshots, and record MP4/WebM/GIF clips.",
 		promptGuidelines: [
 			"Use browser when the user wants Pi to interact with websites, tabs, forms, screenshots, or page inspection.",
-			"Use browser start or browser attach before page actions when no active browser session exists.",
+			"Use browser start or browser attach before page actions when no browser session is open.",
 			"Use browser inspect or browser extract_text instead of dumping large page HTML into context.",
 			"Use workflow_list, workflow_replay, and workflow_details for saved workflow execution; use browser workflow_record_start/workflow_record_stop to record new workflows.",
 		],
@@ -753,25 +1092,29 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			manager ??= new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
 			const input = params as BrowserToolInput;
-			const result = await manager.execute(input);
-			if (input.action === "workflow_record_start") {
-				const activeRecording = result.details.activeRecording as ActiveWorkflowRecording | undefined;
-				workflowUi?.start(activeRecording);
-				if (!workflowUi) {
-					setWorkflowRecordingStatus(ctx, activeRecording);
-					setWorkflowRecordingWidget(ctx, activeRecording);
+			try {
+				const result = await manager.execute(input);
+				if (input.action === "workflow_record_start") {
+					const activeRecording = result.details.activeRecording as ActiveWorkflowRecording | undefined;
+					workflowUi?.start(activeRecording);
+					if (!workflowUi) {
+						setWorkflowRecordingStatus(ctx, activeRecording);
+						setWorkflowRecordingWidget(ctx, activeRecording);
+					}
+				} else if (input.action === "workflow_record_stop") {
+					workflowUi?.clear();
+					if (!workflowUi) {
+						setWorkflowRecordingStatus(ctx, undefined);
+						setWorkflowRecordingWidget(ctx, undefined);
+					}
 				}
-			} else if (input.action === "workflow_record_stop") {
-				workflowUi?.clear();
-				if (!workflowUi) {
-					setWorkflowRecordingStatus(ctx, undefined);
-					setWorkflowRecordingWidget(ctx, undefined);
-				}
+				return {
+					content: [{ type: "text", text: result.text }],
+					details: result.details,
+				};
+			} finally {
+				await sessionsUi?.refreshNow();
 			}
-			return {
-				content: [{ type: "text", text: result.text }],
-				details: result.details,
-			};
 		},
 	});
 
@@ -798,7 +1141,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "workflow_replay",
 		label: "Workflow Replay",
-		description: "Replay a saved workflow in the active browser session, or auto-start a session from workflow metadata.",
+		description: "Replay a saved workflow in the default browser session, or auto-start a session from workflow metadata.",
 		promptSnippet: "Replay a saved workflow by ID or name.",
 		promptGuidelines: [
 			"Always try workflow_replay first.",

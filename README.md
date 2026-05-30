@@ -125,6 +125,7 @@ The extension exposes one broad browser control tool plus dedicated workflow exe
 - `start`
 - `attach`
 - `sessions`
+- `select_session`
 - `stop`
 - `tabs`
 - `new_tab`
@@ -171,7 +172,7 @@ Notes:
 
 ### Recording and replaying workflows
 
-Workflows capture page-level interactions as replayable Puppeteer scripts. Start a workflow recording and pi-puppeteer will use the active browser session if one exists, or open the configured default browser for you. Interact with the page manually or through the `browser` tool, then stop the recorder:
+Workflows capture page-level interactions as replayable Puppeteer scripts. Start a workflow recording and pi-puppeteer will use the default browser session if one exists, or open the configured default browser for you. Interact with the page manually or through the `browser` tool, then stop the recorder:
 
 ```json
 { "action": "workflow_record_start", "workflowName": "login flow" }
@@ -187,6 +188,8 @@ workflow_details({ "workflowName": "login flow" })
 ```
 
 Saved workflow JSON and generated Puppeteer scripts live under `.pi/.pi-puppeteer/workflows/`. Use `/workflows` to open the workflow library UI for recording, replaying, renaming, exporting, and deleting saved workflows.
+
+Open browser sessions show up above the editor as a right-aligned `Browser Session(s): X` indicator when at least one session is open. Press `Alt+P` or run `/browser` to open the browser manager, open the default browser, inspect tabs, switch the default session, or close/detach a session. Within one Pi session, launching the same browser/profile reuses the existing browser session instead of creating duplicates.
 
 Notes:
 
@@ -207,6 +210,7 @@ Notes:
 - “Record a short GIF while you scroll through the page, then stop and save it.”
 - “Start a workflow recording named login, then replay it later.”
 - “Open `/workflows` and rename the checkout workflow.”
+- “Open `/browser` and close or detach the extra browser session.”
 
 ## Development checks
 

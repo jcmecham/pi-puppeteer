@@ -61,6 +61,7 @@ export class BrowserManager {
 	private nextSessionNumber = 1;
 	private nextRecordingNumber = 1;
 	private nextWorkflowRecordingNumber = 1;
+	private launchSessionLocks = new Map<string, Promise<void>>();
 
 	constructor(
 		private readonly cwd: string,
@@ -93,6 +94,8 @@ export class BrowserManager {
 				return this.attach(input);
 			case "sessions":
 				return this.listSessions();
+			case "select_session":
+				return this.selectSession(input.sessionId);
 			case "stop":
 				return this.stop(input.sessionId);
 			case "tabs":
@@ -197,41 +200,48 @@ export class BrowserManager {
 		const userDataDir = join(this.config.profileRoot, browserKey, profile);
 		await mkdir(userDataDir, { recursive: true });
 
-		const { browser, dispose } = await getAdapter(definition.engine).launch(definition, {
-			executablePath,
-			headless: input.headless ?? this.config.defaults.headless,
-			userDataDir,
-		});
+		return this.withLaunchSessionLock(browserKey, profile, async () => {
+			const existingSession = await this.findReusableLaunchSession(browserKey, profile);
+			if (existingSession) {
+				return this.reuseLaunchSession(existingSession, input, userDataDir);
+			}
 
-		const session = await this.registerSession({
-			browser,
-			browserKey,
-			displayName: definition.displayName,
-			engine: definition.engine,
-			mode: "launch",
-			profile,
-			dispose,
-		});
-
-		const tabs = await this.syncPages(session);
-		const currentPage = await this.resolvePage(session);
-		if (input.url) {
-			await currentPage.goto(input.url, {
-				waitUntil: input.waitUntil ?? this.config.defaults.navigationWaitUntil,
-				timeout: input.timeoutMs ?? this.config.defaults.timeoutMs,
+			const { browser, dispose } = await getAdapter(definition.engine).launch(definition, {
+				executablePath,
+				headless: input.headless ?? this.config.defaults.headless,
+				userDataDir,
 			});
-			this.recordWorkflowStep(session.id, session.currentPageId, { type: "navigate", url: currentPage.url(), timestamp: Date.now() });
-		}
 
-		return {
-			text: `Started ${definition.displayName} as ${session.id}${input.url ? ` and opened ${input.url}` : ""}.`,
-			details: {
-				action: "start",
-				session: await this.summarizeSession(session),
-				tabs,
-				profilePath: userDataDir,
-			},
-		};
+			const session = await this.registerSession({
+				browser,
+				browserKey,
+				displayName: definition.displayName,
+				engine: definition.engine,
+				mode: "launch",
+				profile,
+				dispose,
+			});
+
+			const tabs = await this.syncPages(session);
+			const currentPage = await this.resolvePage(session);
+			if (input.url) {
+				await currentPage.goto(input.url, {
+					waitUntil: input.waitUntil ?? this.config.defaults.navigationWaitUntil,
+					timeout: input.timeoutMs ?? this.config.defaults.timeoutMs,
+				});
+				this.recordWorkflowStep(session.id, session.currentPageId, { type: "navigate", url: currentPage.url(), timestamp: Date.now() });
+			}
+
+			return {
+				text: `Started ${definition.displayName} as ${session.id}${input.url ? ` and opened ${input.url}` : ""}.`,
+				details: {
+					action: "start",
+					session: await this.summarizeSession(session),
+					tabs,
+					profilePath: userDataDir,
+				},
+			};
+		});
 	}
 
 	private async attach(input: BrowserToolInput): Promise<ToolResponse> {
@@ -264,31 +274,42 @@ export class BrowserManager {
 	}
 
 	private async listSessions(): Promise<ToolResponse> {
-		const sessions = await Promise.all([...this.sessions.values()].map((session) => this.summarizeSession(session)));
+		const sessions = await this.collectSessionSummaries();
 		if (!sessions.length) {
 			return {
-				text: "No browser sessions are active.",
+				text: "No browser sessions are open.",
 				details: { action: "sessions", sessions: [] },
 			};
 		}
 
 		return {
-			text: `Active sessions:\n${sessions
-				.map((session) => `${session.id}: ${session.displayName} (${session.mode}, ${session.tabCount} tab${session.tabCount === 1 ? "" : "s"})`)
+			text: `Open sessions:\n${sessions
+				.map((session) => `${session.id}: ${session.displayName} (${session.mode}, ${session.tabCount} tab${session.tabCount === 1 ? "" : "s"})${session.current ? " · default" : ""}`)
 				.join("\n")}`,
 			details: { action: "sessions", currentSessionId: this.currentSessionId ?? null, sessions },
+		};
+	}
+
+	private async selectSession(sessionId?: string): Promise<ToolResponse> {
+		if (!sessionId) throw new Error("sessionId is required for select_session.");
+		const session = this.resolveSession(sessionId);
+		this.currentSessionId = session.id;
+		await this.syncPages(session);
+		const currentPage = session.currentPageId ? session.pages.get(session.currentPageId) : undefined;
+		await currentPage?.bringToFront().catch(() => undefined);
+		this.markSessionActive(session);
+		return {
+			text: `Set ${session.id} as the default session.`,
+			details: { action: "select_session", session: await this.summarizeSession(session) },
 		};
 	}
 
 	private async stop(sessionId?: string): Promise<ToolResponse> {
 		const session = this.resolveSession(sessionId);
 		await this.stopSession(session);
-		this.sessions.delete(session.id);
-		if (this.currentSessionId === session.id) {
-			this.currentSessionId = this.sessions.keys().next().value;
-		}
+		this.removeSession(session.id);
 		return {
-			text: `Stopped ${session.id}.`,
+			text: session.mode === "attach" ? `Detached from ${session.id}.` : `Stopped ${session.id}.`,
 			details: { action: "stop", sessionId: session.id },
 		};
 	}
@@ -316,6 +337,7 @@ export class BrowserManager {
 		const tabs = await this.syncPages(session);
 		const created = tabs.find((tab) => session.pages.get(tab.id) === page);
 		if (created) session.currentPageId = created.id;
+		this.markSessionActive(session);
 		if (input.url) {
 			this.recordWorkflowStep(session.id, created?.id, { type: "navigate", url: page.url(), timestamp: Date.now() });
 		}
@@ -335,6 +357,7 @@ export class BrowserManager {
 		session.currentPageId = input.tabId;
 		const page = session.pages.get(input.tabId)!;
 		await page.bringToFront().catch(() => undefined);
+		this.markSessionActive(session);
 		return {
 			text: `Selected ${input.tabId} in ${session.id}.`,
 			details: { action: "select_tab", sessionId: session.id, tabId: input.tabId, url: page.url() },
@@ -1074,6 +1097,84 @@ export class BrowserManager {
 		return workflowRoot(this.config.artifactRoot);
 	}
 
+	private launchSessionKey(browserKey: string, profile: string): string {
+		return `${browserKey}:${profile}`;
+	}
+
+	private async withLaunchSessionLock<T>(browserKey: string, profile: string, task: () => Promise<T>): Promise<T> {
+		const key = this.launchSessionKey(browserKey, profile);
+		const previous = this.launchSessionLocks.get(key) ?? Promise.resolve();
+		let release!: () => void;
+		const current = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const queued = previous.then(() => current);
+		this.launchSessionLocks.set(key, queued);
+		await previous;
+		try {
+			return await task();
+		} finally {
+			release();
+			if (this.launchSessionLocks.get(key) === queued) {
+				this.launchSessionLocks.delete(key);
+			}
+		}
+	}
+
+	private async findReusableLaunchSession(browserKey: string, profile: string): Promise<BrowserSessionRecord | undefined> {
+		const session = [...this.sessions.values()].find(
+			(candidate) => candidate.mode === "launch" && candidate.browserKey === browserKey && candidate.profile === profile,
+		);
+		if (!session) return undefined;
+		try {
+			await this.syncPages(session);
+			return session;
+		} catch {
+			this.removeSession(session.id);
+			return undefined;
+		}
+	}
+
+	private async reuseLaunchSession(session: BrowserSessionRecord, input: BrowserToolInput, profilePath: string): Promise<ToolResponse> {
+		this.currentSessionId = session.id;
+		let tabs = await this.syncPages(session);
+		if (input.url) {
+			const page = await session.browser.newPage();
+			await page.goto(input.url, {
+				waitUntil: input.waitUntil ?? this.config.defaults.navigationWaitUntil,
+				timeout: input.timeoutMs ?? this.config.defaults.timeoutMs,
+			});
+			await page.bringToFront().catch(() => undefined);
+			tabs = await this.syncPages(session);
+			const created = tabs.find((tab) => session.pages.get(tab.id) === page);
+			if (created) session.currentPageId = created.id;
+			this.markSessionActive(session);
+			this.recordWorkflowStep(session.id, created?.id, { type: "navigate", url: page.url(), timestamp: Date.now() });
+			return {
+				text: `Reused ${session.id} (${session.displayName} profile ${session.profile ?? "default"}) and opened ${input.url} in a new tab.`,
+				details: {
+					action: "start",
+					session: await this.summarizeSession(session),
+					tabs,
+					profilePath,
+				},
+			};
+		}
+
+		const currentPage = await this.resolvePage(session);
+		await currentPage.bringToFront().catch(() => undefined);
+		tabs = await this.syncPages(session);
+		return {
+			text: `Reused ${session.id} (${session.displayName} profile ${session.profile ?? "default"}).`,
+			details: {
+				action: "start",
+				session: await this.summarizeSession(session),
+				tabs,
+				profilePath,
+			},
+		};
+	}
+
 	private async registerSession(input: {
 		browser: Browser;
 		browserKey: string;
@@ -1083,6 +1184,7 @@ export class BrowserManager {
 		profile?: string;
 		dispose?: () => Promise<void>;
 	}): Promise<BrowserSessionRecord> {
+		const createdAt = Date.now();
 		const session: BrowserSessionRecord = {
 			id: `session-${this.nextSessionNumber++}`,
 			browserKey: input.browserKey,
@@ -1094,11 +1196,16 @@ export class BrowserManager {
 			pages: new Map<string, Page>(),
 			currentPageId: undefined,
 			nextTabNumber: 1,
-			createdAt: Date.now(),
+			createdAt,
+			lastActiveAt: createdAt,
 			dispose: input.dispose,
 		};
 		this.sessions.set(session.id, session);
 		this.currentSessionId = session.id;
+		const browserWithEvents = input.browser as Browser & { on?: (event: string, listener: () => void) => void };
+		browserWithEvents.on?.("disconnected", () => {
+			this.removeSession(session.id);
+		});
 		const pages = await input.browser.pages();
 		if (!pages.length) {
 			await input.browser.newPage();
@@ -1140,7 +1247,7 @@ export class BrowserManager {
 	private resolveSession(sessionId?: string): BrowserSessionRecord {
 		const resolvedId = sessionId ?? this.currentSessionId;
 		if (!resolvedId) {
-			throw new Error("No browser session is active. Start or attach to a browser first.");
+			throw new Error("No browser session is open. Start or attach to a browser first.");
 		}
 		const session = this.sessions.get(resolvedId);
 		if (!session) {
@@ -1155,6 +1262,7 @@ export class BrowserManager {
 		if (!resolvedTabId) {
 			const page = await session.browser.newPage();
 			await this.syncPages(session);
+			this.markSessionActive(session);
 			return page;
 		}
 		const page = session.pages.get(resolvedTabId);
@@ -1162,6 +1270,7 @@ export class BrowserManager {
 			throw new Error(`Unknown tab '${resolvedTabId}' in ${session.id}.`);
 		}
 		session.currentPageId = resolvedTabId;
+		this.markSessionActive(session);
 		return page;
 	}
 
@@ -1180,7 +1289,8 @@ export class BrowserManager {
 	}
 
 	private async summarizeSession(session: BrowserSessionRecord): Promise<SessionSummary> {
-		await this.syncPages(session);
+		const tabs = await this.syncPages(session);
+		const currentTab = tabs.find((tab) => tab.current);
 		return {
 			id: session.id,
 			browserKey: session.browserKey,
@@ -1191,7 +1301,38 @@ export class BrowserManager {
 			current: session.id === this.currentSessionId,
 			currentTabId: session.currentPageId,
 			tabCount: session.pages.size,
+			createdAt: session.createdAt,
+			lastActiveAt: session.lastActiveAt,
+			currentUrl: currentTab?.url,
+			currentTitle: currentTab?.title,
+			tabs,
 		};
+	}
+
+	private markSessionActive(session: BrowserSessionRecord): void {
+		session.lastActiveAt = Date.now();
+	}
+
+	private async collectSessionSummaries(): Promise<SessionSummary[]> {
+		const sessions: SessionSummary[] = [];
+		for (const [sessionId, session] of [...this.sessions.entries()]) {
+			try {
+				sessions.push(await this.summarizeSession(session));
+			} catch {
+				this.removeSession(sessionId);
+			}
+		}
+		return sessions;
+	}
+
+	private removeSession(sessionId: string): void {
+		if (!this.sessions.has(sessionId)) return;
+		this.sessions.delete(sessionId);
+		if (this.currentSessionId === sessionId) {
+			this.currentSessionId = this.sessions.keys().next().value;
+		}
+		void this.stopSessionRecordings(sessionId).catch(() => undefined);
+		void this.stopSessionWorkflowRecordings(sessionId).catch(() => undefined);
 	}
 
 	private resolveRecordingFormat(input: BrowserToolInput): RecordingFormat {
