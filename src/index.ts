@@ -29,6 +29,27 @@ function systemOptionLabel(config: ResolvedConfig): string {
 	return `System [${config.systemDefaultBrowser}] — OS default${current}`;
 }
 
+function defaultBrowserOptions(config: ResolvedConfig): Array<{ key: string; label: string }> {
+	const detected = Object.entries(config.browsers).filter(([, definition]) => Boolean(definition.executablePath));
+	return [
+		{ key: "system", label: systemOptionLabel(config) },
+		...detected.map(([key, definition]) => ({
+			key,
+			label: browserOptionLabel(key, definition, config.defaultBrowserSetting),
+		})),
+	];
+}
+
+async function chooseDefaultBrowser(
+	ctx: ExtensionCommandContext | ExtensionContext,
+	config: ResolvedConfig,
+): Promise<string | undefined> {
+	const options = defaultBrowserOptions(config);
+	const choice = await ctx.ui.select("Select default browser:", options.map((option) => option.label));
+	if (!choice) return undefined;
+	return options.find((option) => option.label === choice)?.key;
+}
+
 interface WorkflowStatusUiContext {
 	ui: {
 		theme: { fg: (...args: any[]) => string };
@@ -65,7 +86,9 @@ type WorkflowLibraryAction =
 type SessionManagerAction =
 	| { type: "exit" }
 	| { type: "create" }
-	| { type: "activate"; session: SessionSummary }
+	| { type: "change-default-browser" }
+	| { type: "show"; session: SessionSummary }
+	| { type: "rename"; session: SessionSummary }
 	| { type: "close"; session: SessionSummary };
 
 const WORKFLOW_RECORDING_WIDGET_KEY = "pi-puppeteer-workflow-recording";
@@ -552,17 +575,6 @@ function formatRelativeTime(timestamp?: number): string {
 	return `${days}d ago`;
 }
 
-function compactUrl(url?: string): string {
-	if (!url) return "(no URL)";
-	try {
-		const parsed = new URL(url);
-		const compact = `${parsed.host}${parsed.pathname === "/" ? "" : parsed.pathname}${parsed.search}`;
-		return compact || url;
-	} catch {
-		return url;
-	}
-}
-
 function setBrowserSessionsStatus(ctx: WorkflowStatusUiContext, count: number): void {
 	ctx.ui.setStatus(BROWSER_SESSIONS_STATUS_KEY, undefined);
 	if (count <= 0) {
@@ -606,89 +618,108 @@ async function showBrowserSessionsScreen(
 				const innerWidth = Math.max(1, minWidth - 4);
 				const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
 				const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
-				const boxed = (content: string) => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
+				const boxed = (content = "") => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
+				const selectedLine = (content: string) => {
+					const padded = padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth);
+					const highlighted = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
+					return `${theme.fg("borderMuted", "│ ")}${highlighted}${theme.fg("borderMuted", " │")}`;
+				};
 				const selected = sessions[selectedIndex];
 				const lines = [
 					border("╭", "─", "╮"),
 					boxed(theme.fg("text", bold("Browser Manager"))),
-					boxed(theme.fg("muted", sessions.length ? "Choose which browser Pi should use by default." : "No browser sessions are open.")),
-					boxed(""),
 				];
 
 				if (!sessions.length) {
-					lines.push(boxed(theme.fg("muted", `Press ${workflowKeycap(theme, "N", "accent")} to open the default browser.`)));
+					lines.push(
+						boxed(theme.fg("muted", "No browser sessions are open.")),
+						boxed(""),
+					);
 				} else {
-					const maxVisible = 4;
+					lines.push(boxed(""));
+					const maxVisible = 6;
 					const visibleCount = Math.min(maxVisible, sessions.length);
 					const start = Math.max(0, Math.min(selectedIndex - Math.floor(visibleCount / 2), sessions.length - visibleCount));
 					const end = start + visibleCount;
-					lines.push(boxed(theme.fg("dim", "Open browsers")));
-					if (start > 0) lines.push(boxed(theme.fg("dim", `  … ${start} earlier`)));
+					const gap = "  ";
+					const column = (content: string, columnWidth: number) => padAnsiEnd(truncateAnsi(content, columnWidth), columnWidth);
+					const row = (columns: Array<[string, number]>) => columns.map(([content, columnWidth]) => column(content, columnWidth)).join(gap);
+					const nameWidth = Math.min(24, Math.max("Name".length, ...sessions.map((session) => session.name.length + 2)));
+					const minBrowserWidth = 10;
+					const naturalBrowserWidth = Math.min(28, Math.max("Browser".length, ...sessions.map((session) => session.displayName.length)));
+					const fullTableFixedWidth = nameWidth + gap.length;
+					const useFullTable = fullTableFixedWidth + minBrowserWidth <= innerWidth;
+					const browserWidth = useFullTable
+						? Math.min(naturalBrowserWidth, Math.max(minBrowserWidth, innerWidth - fullTableFixedWidth))
+						: 0;
+					const compactDetailsWidth = Math.max(1, innerWidth - nameWidth - gap.length);
+
+					if (useFullTable) {
+						lines.push(boxed(row([
+							[theme.fg("dim", "Name"), nameWidth],
+							[theme.fg("dim", "Browser"), browserWidth],
+						])));
+					} else {
+						lines.push(boxed(row([
+							[theme.fg("dim", "Name"), nameWidth],
+							[theme.fg("dim", "Browser"), compactDetailsWidth],
+						])));
+					}
+					if (start > 0) lines.push(boxed(theme.fg("dim", `… ${start} earlier`)));
 					for (let index = start; index < end; index += 1) {
 						const session = sessions[index]!;
-						const prefix = index === selectedIndex ? theme.fg("accent", "→ ") : "  ";
-						const scope = session.mode === "launch" ? `profile ${session.profile ?? "default"}` : "attached browser";
-						const metaBits = [session.id, `${session.tabCount} tab${session.tabCount === 1 ? "" : "s"}`];
-						if (session.current) metaBits.push("used by default");
-						lines.push(boxed(`${prefix}${theme.fg(index === selectedIndex ? "accent" : "text", `${session.displayName} · ${scope}`)}`));
-						lines.push(boxed(`   ${theme.fg("muted", metaBits.join(" · "))}`));
+						const isSelected = index === selectedIndex;
+						const marker = isSelected ? theme.fg("accent", "›") : " ";
+						const name = theme.fg(isSelected ? "accent" : "text", session.name);
+						const browser = theme.fg(isSelected ? "accent" : "text", session.displayName);
+						const nameCell = `${marker} ${name}`;
+						const renderedRow = row([
+							[nameCell, nameWidth],
+							[browser, useFullTable ? browserWidth : compactDetailsWidth],
+						]);
+						lines.push(isSelected ? selectedLine(renderedRow) : boxed(renderedRow));
 					}
-					if (end < sessions.length) lines.push(boxed(theme.fg("dim", `  … ${sessions.length - end} more`)));
-
-					if (selected) {
-						const currentTab = selected.tabs.find((tab) => tab.current) ?? selected.tabs[0];
-						const currentTitle = currentTab ? currentTab.title || compactUrl(currentTab.url) || "(untitled)" : "No tabs open";
-						const currentUrl = currentTab ? compactUrl(currentTab.url) : "";
-						const extraTabs = Math.max(0, selected.tabCount - (currentTab ? 1 : 0));
-						lines.push(
-							boxed(""),
-							boxed(theme.fg("dim", "Selected browser")),
-							boxed(theme.fg("muted", selected.current ? "Browser commands use this session by default." : `Press ${workflowKeycap(theme, "Enter", "accent")} to use this session by default.`)),
-							boxed(`${theme.fg("text", "Browser:")} ${selected.displayName}`),
-							boxed(`${theme.fg("text", "Source:")} ${selected.mode === "launch" ? `profile ${selected.profile ?? "default"}` : "attached browser"}`),
-							boxed(`${theme.fg("text", "Session:")} ${selected.id}`),
-							boxed(`${theme.fg("text", "Current tab:")} ${currentTitle}`),
-						);
-						if (currentUrl && currentUrl !== currentTitle) {
-							lines.push(boxed(theme.fg("muted", currentUrl)));
-						}
-						if (extraTabs > 0) {
-							lines.push(boxed(theme.fg("dim", `${extraTabs} more open tab${extraTabs === 1 ? "" : "s"}`)));
-						}
-					}
+					if (end < sessions.length) lines.push(boxed(theme.fg("dim", `… ${sessions.length - end} more`)));
 				}
 
-				const stopActionLabel = selected?.mode === "attach" ? "Detach" : "Close";
-				const confirmStopActionLabel = selected?.mode === "attach" ? "Confirm detach" : "Confirm close";
+				const stopActionLabel = selected?.mode === "attach" ? "detach" : "close";
+				const confirmStopActionLabel = selected?.mode === "attach" ? "confirm detach" : "confirm close";
 				const controls = !sessions.length
 					? [
-						`${workflowKeycap(theme, "N", "accent")} Open browser`,
-						`${workflowKeycap(theme, "Esc")} Back`,
-					].join(theme.fg("dim", "  ·  "))
+						`${workflowKeycap(theme, "N", "accent")} open`,
+						`${workflowKeycap(theme, "B", "accent")} change default browser`,
+						`${workflowKeycap(theme, "Esc")} back`,
+					].join(theme.fg("dim", "  "))
 					: closeArmed
 						? [
 							`${workflowKeycap(theme, "D", "warning")} ${confirmStopActionLabel}`,
-							`${workflowKeycap(theme, "Esc")} Cancel`,
-						].join(theme.fg("dim", "  ·  "))
+							`${workflowKeycap(theme, "Esc")} cancel`,
+						].join(theme.fg("dim", "  "))
 						: [
-							`${workflowKeycap(theme, "↑↓")} Move`,
-							`${workflowKeycap(theme, "Enter", "accent")} ${selected?.current ? "Focus" : "Use by default"}`,
-							`${workflowKeycap(theme, "N", "accent")} Open profile`,
+							`${workflowKeycap(theme, "↑↓")} move`,
+							`${workflowKeycap(theme, "Enter", "accent")} show`,
+							`${workflowKeycap(theme, "N", "accent")} new`,
+							`${workflowKeycap(theme, "R", "accent")} rename`,
 							`${workflowKeycap(theme, "D", "accent")} ${stopActionLabel}`,
-							`${workflowKeycap(theme, "Esc")} Back`,
-						].join(theme.fg("dim", "  ·  "));
+							`${workflowKeycap(theme, "B", "accent")} change default browser`,
+							`${workflowKeycap(theme, "Esc")} back`,
+						].join(theme.fg("dim", "  "));
 				lines.push(
 					boxed(""),
 					boxed(controls),
 					border("╰", "─", "╯"),
 				);
-				return lines.map((line) => truncateAnsi(line, width));
+				return lines.map((item) => truncateAnsi(item, width));
 			},
 			invalidate(): void {},
 			handleInput(data: string): void {
 				const selected = sessions[selectedIndex];
 				if (data === "n" || data === "N") {
 					done({ type: "create" });
+					return;
+				}
+				if (data === "b" || data === "B") {
+					done({ type: "change-default-browser" });
 					return;
 				}
 				if (data === "\x1b[A") {
@@ -716,7 +747,11 @@ async function showBrowserSessionsScreen(
 				}
 				if (!selected) return;
 				if (data === "\r" || data === "\n") {
-					done({ type: "activate", session: selected });
+					done({ type: "show", session: selected });
+					return;
+				}
+				if (data === "r" || data === "R") {
+					done({ type: "rename", session: selected });
 					return;
 				}
 				if (data === "d" || data === "D") {
@@ -743,33 +778,45 @@ async function openBrowserSessionsManager(
 ): Promise<void> {
 	let selectedSessionId: string | undefined;
 	while (true) {
+		const config = loadConfig(ctx.cwd);
+		browserManager.setConfig(config);
 		const result = await browserManager.execute({ action: "sessions" });
 		const sessions = ((result.details.sessions as SessionSummary[] | undefined) ?? []);
 		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId);
 		if (action.type === "exit") return;
-		if (action.type !== "create") selectedSessionId = action.session.id;
+		if ("session" in action) selectedSessionId = action.session.id;
 		try {
-			if (action.type === "create") {
-				let profile: string | undefined;
-				if (sessions.length) {
-					const suggestedProfile = `profile-${sessions.length + 1}`;
-					const enteredProfile = await ctx.ui.input("Profile name for the new browser session:", suggestedProfile);
-					if (!enteredProfile) continue;
-					const trimmedProfile = enteredProfile.trim();
-					if (!trimmedProfile) {
-						ctx.ui.notify("Profile name cannot be blank.", "error");
-						continue;
-					}
-					profile = trimmedProfile;
-				}
-				const started = await browserManager.execute({ action: "start", ...(profile ? { profile } : {}) });
+			if (action.type === "change-default-browser") {
+				const selectedKey = await chooseDefaultBrowser(ctx, config);
+				if (!selectedKey) continue;
+				await writeProjectDefaultBrowser(config, selectedKey);
+				const nextConfig = loadConfig(ctx.cwd);
+				browserManager.setConfig(nextConfig);
+				const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
+				ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
+			} else if (action.type === "create") {
+				const existingNames = new Set(sessions.map((session) => session.name.toLowerCase()));
+				let suggestedNumber = 1;
+				while (existingNames.has(`browser-${suggestedNumber}`)) suggestedNumber += 1;
+				const started = await browserManager.execute({ action: "start", name: `Browser-${suggestedNumber}` });
 				const session = started.details.session as SessionSummary | undefined;
 				selectedSessionId = session?.id;
 				ctx.ui.notify(started.text, "info");
-			} else if (action.type === "activate") {
-				const wasDefault = action.session.current;
-				await browserManager.execute({ action: "select_session", sessionId: action.session.id });
-				ctx.ui.notify(wasDefault ? `Focused ${action.session.id}.` : `Default session set to ${action.session.id}.`, "info");
+			} else if (action.type === "show") {
+				const shown = await browserManager.execute({ action: "show_session", sessionId: action.session.id });
+				ctx.ui.notify(shown.text, "info");
+			} else if (action.type === "rename") {
+				const enteredName = await ctx.ui.input("Rename browser:", action.session.name);
+				if (!enteredName) continue;
+				const trimmedName = enteredName.trim();
+				if (!trimmedName) {
+					ctx.ui.notify("Browser name cannot be blank.", "error");
+					continue;
+				}
+				const renamed = await browserManager.execute({ action: "rename_session", sessionId: action.session.id, name: trimmedName });
+				const session = renamed.details.session as SessionSummary | undefined;
+				selectedSessionId = session?.id ?? action.session.id;
+				ctx.ui.notify(renamed.text, "info");
 			} else if (action.type === "close") {
 				const stopped = await browserManager.execute({ action: "stop", sessionId: action.session.id });
 				ctx.ui.notify(stopped.text, "info");
@@ -856,7 +903,8 @@ const BrowserToolSchema = Type.Object({
 			"start",
 			"attach",
 			"sessions",
-			"select_session",
+			"show_session",
+			"rename_session",
 			"stop",
 			"tabs",
 			"new_tab",
@@ -887,6 +935,7 @@ const BrowserToolSchema = Type.Object({
 	browserKey: Type.Optional(Type.String({ description: "Configured browser key, like chrome or edge; use system for the detected OS default browser" })),
 	sessionId: Type.Optional(Type.String({ description: "Browser session ID, like session-1" })),
 	tabId: Type.Optional(Type.String({ description: "Tab ID, like tab-1" })),
+	name: Type.Optional(Type.String({ description: "Friendly browser name shown in the browser manager" })),
 	profile: Type.Optional(Type.String({ description: "Named profile for launch mode" })),
 	url: Type.Optional(Type.String({ description: "URL for start, new_tab, or navigate" })),
 	selector: Type.Optional(Type.String({ description: "CSS selector for page actions" })),
@@ -957,46 +1006,6 @@ export default function (pi: ExtensionAPI) {
 		if (!manager) return;
 		await manager.closeAll();
 		manager = undefined;
-	});
-
-	pi.registerCommand("browser-default", {
-		description: "Choose the default browser for pi-puppeteer",
-		handler: async (args, ctx) => {
-			const config = loadConfig(ctx.cwd);
-			const detected = Object.entries(config.browsers).filter(([, definition]) => Boolean(definition.executablePath));
-
-			let selectedKey = args.trim();
-			if (selectedKey) {
-				if (selectedKey !== "system") {
-					const selected = config.browsers[selectedKey];
-					if (!selected) {
-						ctx.ui.notify(`Unknown browser key: ${selectedKey}`, "error");
-						return;
-					}
-					if (!selected.executablePath) {
-						ctx.ui.notify(`Browser '${selectedKey}' was not detected on this machine.`, "error");
-						return;
-					}
-				}
-			} else {
-				const options = [
-					{ key: "system", label: systemOptionLabel(config) },
-					...detected.map(([key, definition]) => ({
-						key,
-						label: browserOptionLabel(key, definition, config.defaultBrowserSetting),
-					})),
-				];
-				const choice = await ctx.ui.select("Select default browser:", options.map((option) => option.label));
-				if (!choice) return;
-				selectedKey = options.find((option) => option.label === choice)!.key;
-			}
-
-			await writeProjectDefaultBrowser(config, selectedKey);
-			const nextConfig = loadConfig(ctx.cwd);
-			manager?.setConfig(nextConfig);
-			const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
-			ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
-		},
 	});
 
 	pi.registerCommand("browser", {

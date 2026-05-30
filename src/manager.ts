@@ -59,6 +59,7 @@ export class BrowserManager {
 	private workflowRecorderInjectedPages = new WeakSet<Page>();
 	private currentSessionId?: string;
 	private nextSessionNumber = 1;
+	private nextBrowserNameNumber = 1;
 	private nextRecordingNumber = 1;
 	private nextWorkflowRecordingNumber = 1;
 	private launchSessionLocks = new Map<string, Promise<void>>();
@@ -94,8 +95,10 @@ export class BrowserManager {
 				return this.attach(input);
 			case "sessions":
 				return this.listSessions();
-			case "select_session":
-				return this.selectSession(input.sessionId);
+			case "show_session":
+				return this.showSession(input.sessionId);
+			case "rename_session":
+				return this.renameSession(input.sessionId, input.name);
 			case "stop":
 				return this.stop(input.sessionId);
 			case "tabs":
@@ -196,7 +199,8 @@ export class BrowserManager {
 			);
 		}
 
-		const profile = sanitizeSegment(input.profile, "default");
+		const requestedName = this.normalizeSessionName(input.name);
+		const profile = sanitizeSegment(input.profile ?? requestedName, "default");
 		const userDataDir = join(this.config.profileRoot, browserKey, profile);
 		await mkdir(userDataDir, { recursive: true });
 
@@ -214,6 +218,7 @@ export class BrowserManager {
 
 			const session = await this.registerSession({
 				browser,
+				name: requestedName,
 				browserKey,
 				displayName: definition.displayName,
 				engine: definition.engine,
@@ -233,7 +238,7 @@ export class BrowserManager {
 			}
 
 			return {
-				text: `Started ${definition.displayName} as ${session.id}${input.url ? ` and opened ${input.url}` : ""}.`,
+				text: `Started ${session.name} (${definition.displayName}, ${session.id})${input.url ? ` and opened ${input.url}` : ""}.`,
 				details: {
 					action: "start",
 					session: await this.summarizeSession(session),
@@ -255,6 +260,7 @@ export class BrowserManager {
 
 		const session = await this.registerSession({
 			browser,
+			name: this.normalizeSessionName(input.name),
 			browserKey,
 			displayName: definition.displayName,
 			engine: definition.engine,
@@ -263,7 +269,7 @@ export class BrowserManager {
 		const tabs = await this.syncPages(session);
 
 		return {
-			text: `Attached to ${definition.displayName} at ${endpoint} as ${session.id}.`,
+			text: `Attached ${session.name} (${definition.displayName}, ${session.id}) at ${endpoint}.`,
 			details: {
 				action: "attach",
 				endpoint,
@@ -284,14 +290,14 @@ export class BrowserManager {
 
 		return {
 			text: `Open sessions:\n${sessions
-				.map((session) => `${session.id}: ${session.displayName} (${session.mode}, ${session.tabCount} tab${session.tabCount === 1 ? "" : "s"})${session.current ? " · default" : ""}`)
+				.map((session) => `${session.name} (${session.id}): ${session.displayName} (${session.mode}, ${session.tabCount} tab${session.tabCount === 1 ? "" : "s"})${session.current ? " · active" : ""}`)
 				.join("\n")}`,
 			details: { action: "sessions", currentSessionId: this.currentSessionId ?? null, sessions },
 		};
 	}
 
-	private async selectSession(sessionId?: string): Promise<ToolResponse> {
-		if (!sessionId) throw new Error("sessionId is required for select_session.");
+	private async showSession(sessionId?: string): Promise<ToolResponse> {
+		if (!sessionId) throw new Error("sessionId is required for show_session.");
 		const session = this.resolveSession(sessionId);
 		this.currentSessionId = session.id;
 		await this.syncPages(session);
@@ -299,8 +305,20 @@ export class BrowserManager {
 		await currentPage?.bringToFront().catch(() => undefined);
 		this.markSessionActive(session);
 		return {
-			text: `Set ${session.id} as the default session.`,
-			details: { action: "select_session", session: await this.summarizeSession(session) },
+			text: `Showing ${session.name} (${session.id}).`,
+			details: { action: "show_session", session: await this.summarizeSession(session) },
+		};
+	}
+
+	private async renameSession(sessionId: string | undefined, name: string | undefined): Promise<ToolResponse> {
+		if (!sessionId) throw new Error("sessionId is required for rename_session.");
+		const nextName = this.normalizeSessionName(name);
+		if (!nextName) throw new Error("name is required for rename_session.");
+		const session = this.resolveSession(sessionId);
+		session.name = nextName;
+		return {
+			text: `Renamed ${session.id} to ${session.name}.`,
+			details: { action: "rename_session", session: await this.summarizeSession(session) },
 		};
 	}
 
@@ -1137,6 +1155,8 @@ export class BrowserManager {
 
 	private async reuseLaunchSession(session: BrowserSessionRecord, input: BrowserToolInput, profilePath: string): Promise<ToolResponse> {
 		this.currentSessionId = session.id;
+		const requestedName = this.normalizeSessionName(input.name);
+		if (requestedName) session.name = requestedName;
 		let tabs = await this.syncPages(session);
 		if (input.url) {
 			const page = await session.browser.newPage();
@@ -1151,7 +1171,7 @@ export class BrowserManager {
 			this.markSessionActive(session);
 			this.recordWorkflowStep(session.id, created?.id, { type: "navigate", url: page.url(), timestamp: Date.now() });
 			return {
-				text: `Reused ${session.id} (${session.displayName} profile ${session.profile ?? "default"}) and opened ${input.url} in a new tab.`,
+				text: `Reused ${session.name} (${session.id}) and opened ${input.url} in a new tab.`,
 				details: {
 					action: "start",
 					session: await this.summarizeSession(session),
@@ -1165,7 +1185,7 @@ export class BrowserManager {
 		await currentPage.bringToFront().catch(() => undefined);
 		tabs = await this.syncPages(session);
 		return {
-			text: `Reused ${session.id} (${session.displayName} profile ${session.profile ?? "default"}).`,
+			text: `Reused ${session.name} (${session.id}).`,
 			details: {
 				action: "start",
 				session: await this.summarizeSession(session),
@@ -1177,6 +1197,7 @@ export class BrowserManager {
 
 	private async registerSession(input: {
 		browser: Browser;
+		name?: string;
 		browserKey: string;
 		displayName: string;
 		engine: "chromium" | "firefox";
@@ -1187,6 +1208,7 @@ export class BrowserManager {
 		const createdAt = Date.now();
 		const session: BrowserSessionRecord = {
 			id: `session-${this.nextSessionNumber++}`,
+			name: input.name ?? this.nextDefaultSessionName(),
 			browserKey: input.browserKey,
 			displayName: input.displayName,
 			engine: input.engine,
@@ -1244,6 +1266,19 @@ export class BrowserManager {
 		return browserKey === "system" ? this.config.systemDefaultBrowser : browserKey;
 	}
 
+	private normalizeSessionName(name?: string): string | undefined {
+		const trimmed = name?.trim();
+		return trimmed ? trimmed : undefined;
+	}
+
+	private nextDefaultSessionName(): string {
+		const existingNames = new Set([...this.sessions.values()].map((session) => session.name.toLowerCase()));
+		while (existingNames.has(`browser-${this.nextBrowserNameNumber}`.toLowerCase())) {
+			this.nextBrowserNameNumber += 1;
+		}
+		return `Browser-${this.nextBrowserNameNumber++}`;
+	}
+
 	private resolveSession(sessionId?: string): BrowserSessionRecord {
 		const resolvedId = sessionId ?? this.currentSessionId;
 		if (!resolvedId) {
@@ -1293,6 +1328,7 @@ export class BrowserManager {
 		const currentTab = tabs.find((tab) => tab.current);
 		return {
 			id: session.id,
+			name: session.name,
 			browserKey: session.browserKey,
 			displayName: session.displayName,
 			engine: session.engine,

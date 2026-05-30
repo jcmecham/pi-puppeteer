@@ -12,7 +12,8 @@ export type BrowserAction =
 	| "start"
 	| "attach"
 	| "sessions"
-	| "select_session"
+	| "show_session"
+	| "rename_session"
 	| "stop"
 	| "tabs"
 	| "new_tab"
@@ -98,6 +99,7 @@ export interface BrowserToolInput {
 	browserKey?: string;
 	sessionId?: string;
 	tabId?: string;
+	name?: string;
 	profile?: string;
 	url?: string;
 	selector?: string;
@@ -133,6 +135,7 @@ export interface PageRecord {
 
 export interface SessionSummary {
 	id: string;
+	name: string;
 	browserKey: string;
 	displayName: string;
 	engine: BrowserEngine;
@@ -150,6 +153,7 @@ export interface SessionSummary {
 
 export interface BrowserSessionRecord {
 	id: string;
+	name: string;
 	browserKey: string;
 	displayName: string;
 	engine: BrowserEngine;

@@ -8,7 +8,7 @@ Pi extension package for browser automation with a browser-agnostic architecture
 - **v1 focus:** Chrome, Edge, Brave, Opera, Vivaldi, and Yandex Browser via a shared Chromium adapter
 - **Connection modes:** launch a configured browser profile or attach to an existing Chromium debugging endpoint
 - **Tool surface:** one broad `browser` tool for core browser control plus dedicated `workflow_list`, `workflow_replay`, and `workflow_details` tools for saved workflows
-- **Session model:** explicit session IDs and tab IDs
+- **Session model:** explicit session IDs and tab IDs, plus friendly browser names in the UI
 - **Profile model:** named persistent profiles stored under `.pi/.pi-puppeteer/profiles/`
 
 Firefox is intentionally planned next. The internal architecture already keeps a transport split between **Chromium/CDP** and future **Firefox/WebDriver BiDi** support.
@@ -69,7 +69,9 @@ Project config, persistent profiles, and artifacts live under `<cwd>/.pi/.pi-pup
 
 Fresh installs use `defaultBrowser: "system"`, which means the detected operating-system default browser. On Windows, this reads the per-user `UrlAssociations\\http(s)\\UserChoice` ProgID (for example, `BraveHTML` resolves to `brave`). If detection is unavailable or unsupported, it falls back to Chrome.
 
-Run the interactive picker to keep `system` or choose a discovered browser. It writes `defaultBrowser` to `.pi/.pi-puppeteer/settings.json`:
+Use `/browser` and press `B` to keep `system` or choose a discovered browser. That writes `defaultBrowser` to `.pi/.pi-puppeteer/settings.json`.
+
+For bootstrap or non-interactive setup, you can still use:
 
 ```bash
 npm run configure             # interactive menu
@@ -125,7 +127,8 @@ The extension exposes one broad browser control tool plus dedicated workflow exe
 - `start`
 - `attach`
 - `sessions`
-- `select_session`
+- `show_session`
+- `rename_session`
 - `stop`
 - `tabs`
 - `new_tab`
@@ -189,7 +192,7 @@ workflow_details({ "workflowName": "login flow" })
 
 Saved workflow JSON and generated Puppeteer scripts live under `.pi/.pi-puppeteer/workflows/`. Use `/workflows` to open the workflow library UI for recording, replaying, renaming, exporting, and deleting saved workflows.
 
-Open browser sessions show up above the editor as a right-aligned `Browser Session(s): X` indicator when at least one session is open. Press `Alt+P` or run `/browser` to open the browser manager, open the default browser, inspect tabs, switch the default session, or close/detach a session. Within one Pi session, launching the same browser/profile reuses the existing browser session instead of creating duplicates.
+Open browser sessions show up above the editor as a right-aligned `Browser Session(s): X` indicator when at least one session is open. Press `Alt+P` or run `/browser` to open the browser manager, open the default browser, change the project default browser with `B`, rename a selected browser, show a selected session, or close/detach a session. Browser manager entries use friendly names like `Browser-1` by default, and tool calls can pass `name` when starting or attaching a browser. For launch-mode sessions, `name` also becomes the default profile key unless you explicitly pass `profile`. Within one Pi session, launching the same browser/profile reuses the existing browser session instead of creating duplicates.
 
 Notes:
 
@@ -202,8 +205,8 @@ Notes:
 
 ### Example prompts to Pi
 
-- “Start Chrome with profile `default` and open example.com.”
-- “Attach to my running Edge debugging endpoint on port 9222.”
+- “Start Chrome named `Docs` and open example.com.”
+- “Attach to my running Edge debugging endpoint on port 9222 and name it `Debug Edge`.”
 - “Click the sign in button in browser session 1.”
 - “Inspect the current page and summarize headings, forms, and links.”
 - “Take a full-page screenshot and save it under artifacts/login.png.”
