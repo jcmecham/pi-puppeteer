@@ -7,7 +7,7 @@ Pi extension package for browser automation with a browser-agnostic architecture
 - **Primary runtime:** `puppeteer-core`
 - **v1 focus:** Chrome, Edge, Brave, Opera, Vivaldi, and Yandex Browser via a shared Chromium adapter
 - **Connection modes:** launch a configured browser profile or attach to an existing Chromium debugging endpoint
-- **Tool surface:** one broad `browser` tool with core actions plus inspect capabilities
+- **Tool surface:** one broad `browser` tool with core actions, inspect capabilities, screenshots, and ffmpeg-backed recordings
 - **Session model:** explicit session IDs and tab IDs
 - **Profile model:** named persistent profiles stored under `.pi/.pi-puppeteer/profiles/`
 
@@ -134,6 +134,26 @@ The extension exposes a single tool named `browser`.
 - `extract_text`
 - `inspect`
 - `screenshot`
+- `record_start`
+- `record_stop`
+
+### Recording browsing clips
+
+The `record_start` action captures the current tab viewport as PNG frames and pipes them to `ffmpeg`, so it works in both headed and headless sessions without OS-specific screen-capture setup. The package uses the npm `ffmpeg-static` binary when available; otherwise install `ffmpeg` on `PATH`, or pass `ffmpegPath`.
+
+Examples:
+
+```json
+{ "action": "record_start", "format": "mp4", "fps": 10 }
+{ "action": "record_start", "path": "artifacts/demo.gif", "fps": 8 }
+{ "action": "record_stop", "recordingId": "recording-1" }
+```
+
+Notes:
+
+- Default output path: `.pi/.pi-puppeteer/artifacts/recordings/<session>-<tab>-<timestamp>.mp4`
+- Supported formats: `mp4`, `webm`, `gif`; format is inferred from `path` when possible.
+- Recording captures page content, not browser chrome/UI.
 
 ### Example prompts to Pi
 
@@ -142,6 +162,7 @@ The extension exposes a single tool named `browser`.
 - “Click the sign in button in browser session 1.”
 - “Inspect the current page and summarize headings, forms, and links.”
 - “Take a full-page screenshot and save it under artifacts/login.png.”
+- “Record a short GIF while you scroll through the page, then stop and save it.”
 
 ## Development checks
 
@@ -152,7 +173,7 @@ npm run validate                       # clean generated build output and type-c
 npm pack --dry-run                     # inspect package contents
 ```
 
-Browser profiles and screenshots created during local use live under `.pi/.pi-puppeteer/`; this runtime state is intentionally ignored by git.
+Browser profiles, screenshots, and recordings created during local use live under `.pi/.pi-puppeteer/`; this runtime state is intentionally ignored by git.
 
 ## Notes
 

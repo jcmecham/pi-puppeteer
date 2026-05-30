@@ -1,8 +1,10 @@
+import type { ChildProcess } from "node:child_process";
 import type { Browser, Page } from "puppeteer-core";
 
 export type BrowserEngine = "chromium" | "firefox";
 export type SessionMode = "launch" | "attach";
 export type NavigationWaitUntil = "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
+export type RecordingFormat = "mp4" | "webm" | "gif";
 
 export type BrowserAction =
 	| "list_browsers"
@@ -22,7 +24,9 @@ export type BrowserAction =
 	| "wait_for"
 	| "extract_text"
 	| "inspect"
-	| "screenshot";
+	| "screenshot"
+	| "record_start"
+	| "record_stop";
 
 export interface AttachConfig {
 	browserURL?: string;
@@ -98,6 +102,10 @@ export interface BrowserToolInput {
 	scrollX?: number;
 	scrollY?: number;
 	executablePath?: string;
+	recordingId?: string;
+	format?: RecordingFormat;
+	fps?: number;
+	ffmpegPath?: string;
 }
 
 export interface PageRecord {
@@ -133,4 +141,22 @@ export interface BrowserSessionRecord {
 	createdAt: number;
 	// Teardown for launch-mode sessions; undefined for attach-mode sessions.
 	dispose?: () => Promise<void>;
+}
+
+export interface RecordingRecord {
+	id: string;
+	sessionId: string;
+	tabId: string;
+	page: Page;
+	outputPath: string;
+	format: RecordingFormat;
+	fps: number;
+	process: ChildProcess;
+	startedAt: number;
+	frameCount: number;
+	active: boolean;
+	busy: boolean;
+	timer: NodeJS.Timeout;
+	stderr: string;
+	exitCode?: number | null;
 }

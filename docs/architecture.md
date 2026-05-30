@@ -7,7 +7,7 @@ These are the design choices confirmed for the first milestone:
 - **Connection model:** launch + attach
 - **Browser scope:** top Chromium browsers first
 - **Tool surface:** one broad browser tool
-- **Capabilities:** core actions + inspect capabilities
+- **Capabilities:** core actions + inspect capabilities + screenshots + ffmpeg-backed viewport recordings
 - **Profiles:** named persistent profiles
 - **Packaging:** Pi package
 - **State model:** explicit session IDs
@@ -199,6 +199,7 @@ This is enough to support many agent workflows without flooding context.
 - session + tab management
 - core interaction actions
 - screenshot saving
+- MP4/WebM/GIF viewport recording via ffmpeg
 - inspect / text extraction primitives
 
 ### Explicitly deferred
@@ -210,6 +211,7 @@ This is enough to support many agent workflows without flooding context.
 - browser extension injection
 - advanced DOM replay / self-healing selectors
 - macro workflow language
+- OS-level browser chrome/window recording (current recording captures the page viewport)
 - remote/cloud browser providers
 - login/session import from personal browser profiles
 

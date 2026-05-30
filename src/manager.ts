@@ -1,11 +1,15 @@
+import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import type { Browser, Page } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
 import type {
 	BrowserSessionRecord,
 	BrowserToolInput,
 	PageRecord,
+	RecordingFormat,
+	RecordingRecord,
 	ResolvedConfig,
 	SessionSummary,
 } from "./types.ts";
@@ -14,6 +18,9 @@ interface ToolResponse {
 	text: string;
 	details: Record<string, unknown>;
 }
+
+const require = createRequire(import.meta.url);
+const bundledFfmpegPath = require("ffmpeg-static") as string | null;
 
 function truncate(value: string, max = 4000): string {
 	return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
@@ -26,8 +33,10 @@ function sanitizeSegment(value: string | undefined, fallback: string): string {
 
 export class BrowserManager {
 	private sessions = new Map<string, BrowserSessionRecord>();
+	private recordings = new Map<string, RecordingRecord>();
 	private currentSessionId?: string;
 	private nextSessionNumber = 1;
+	private nextRecordingNumber = 1;
 
 	constructor(
 		private readonly cwd: string,
@@ -84,6 +93,10 @@ export class BrowserManager {
 				return this.inspect(input);
 			case "screenshot":
 				return this.screenshot(input);
+			case "record_start":
+				return this.recordStart(input);
+			case "record_stop":
+				return this.recordStop(input);
 			default:
 				throw new Error(`Unsupported browser action: ${String(input.action)}`);
 		}
@@ -282,6 +295,7 @@ export class BrowserManager {
 		const session = this.resolveSession(input.sessionId);
 		const page = await this.resolvePage(session, input.tabId);
 		const closingId = input.tabId ?? session.currentPageId;
+		if (closingId) await this.stopSessionRecordings(session.id, closingId);
 		await page.close();
 		const tabs = await this.syncPages(session);
 		return {
@@ -505,6 +519,98 @@ export class BrowserManager {
 		};
 	}
 
+	private async recordStart(input: BrowserToolInput): Promise<ToolResponse> {
+		const session = this.resolveSession(input.sessionId);
+		const page = await this.resolvePage(session, input.tabId);
+		const tabId = session.currentPageId;
+		if (!tabId) throw new Error("No tab is active to record.");
+
+		const format = this.resolveRecordingFormat(input);
+		const fps = Math.max(1, Math.min(30, Math.round(input.fps ?? 10)));
+		const outputPath = input.path
+			? resolve(this.cwd, input.path)
+			: join(this.config.artifactRoot, "recordings", `${session.id}-${sanitizeSegment(tabId, "tab")}-${Date.now()}.${format}`);
+		await mkdir(dirname(outputPath), { recursive: true });
+
+		const ffmpegPath = input.ffmpegPath ?? bundledFfmpegPath ?? "ffmpeg";
+		const ffmpeg = spawn(ffmpegPath, this.ffmpegArgs(format, fps, outputPath), {
+			stdio: ["pipe", "ignore", "pipe"],
+		});
+		await this.waitForSpawn(ffmpeg, ffmpegPath);
+
+		const recording: RecordingRecord = {
+			id: `recording-${this.nextRecordingNumber++}`,
+			sessionId: session.id,
+			tabId,
+			page,
+			outputPath,
+			format,
+			fps,
+			process: ffmpeg,
+			startedAt: Date.now(),
+			frameCount: 0,
+			active: true,
+			busy: false,
+			timer: setInterval(() => {
+				void this.captureRecordingFrame(recording);
+			}, Math.round(1000 / fps)),
+			stderr: "",
+		};
+
+		ffmpeg.stderr?.on("data", (chunk: Buffer) => {
+			recording.stderr = truncate(`${recording.stderr}${chunk.toString("utf8")}`, 5000);
+		});
+		ffmpeg.on("exit", (code) => {
+			recording.exitCode = code;
+			recording.active = false;
+			clearInterval(recording.timer);
+		});
+
+		this.recordings.set(recording.id, recording);
+		await this.captureRecordingFrame(recording);
+
+		return {
+			text: `Started ${format.toUpperCase()} recording ${recording.id} for ${session.id}/${tabId}; stop it with record_stop. Output: ${this.displayPath(outputPath)}.`,
+			details: {
+				action: "record_start",
+				recordingId: recording.id,
+				sessionId: session.id,
+				tabId,
+				path: outputPath,
+				format,
+				fps,
+			},
+		};
+	}
+
+	private async recordStop(input: BrowserToolInput): Promise<ToolResponse> {
+		const recording = this.resolveRecording(input.recordingId, input.sessionId, input.tabId);
+		await this.stopRecording(recording);
+		this.recordings.delete(recording.id);
+
+		const elapsedMs = Date.now() - recording.startedAt;
+		const durationMs = Math.round((recording.frameCount / recording.fps) * 1000);
+		if (recording.exitCode && recording.exitCode !== 0) {
+			throw new Error(`Recording ${recording.id} failed with ffmpeg exit code ${recording.exitCode}: ${recording.stderr || "no ffmpeg stderr"}`);
+		}
+
+		return {
+			text: `Saved recording ${recording.id} to ${this.displayPath(recording.outputPath)} (${recording.frameCount} frames, ${(durationMs / 1000).toFixed(1)}s video, ${(elapsedMs / 1000).toFixed(1)}s elapsed).`,
+			details: {
+				action: "record_stop",
+				recordingId: recording.id,
+				sessionId: recording.sessionId,
+				tabId: recording.tabId,
+				path: recording.outputPath,
+				format: recording.format,
+				fps: recording.fps,
+				frameCount: recording.frameCount,
+				durationMs,
+				elapsedMs,
+			},
+		};
+	}
+
 	private async registerSession(input: {
 		browser: Browser;
 		browserKey: string;
@@ -597,6 +703,7 @@ export class BrowserManager {
 	}
 
 	private async stopSession(session: BrowserSessionRecord): Promise<void> {
+		await this.stopSessionRecordings(session.id);
 		if (session.mode === "attach") {
 			session.browser.disconnect();
 			return;
@@ -621,6 +728,111 @@ export class BrowserManager {
 			currentTabId: session.currentPageId,
 			tabCount: session.pages.size,
 		};
+	}
+
+	private resolveRecordingFormat(input: BrowserToolInput): RecordingFormat {
+		if (input.format) return input.format;
+		const extension = extname(input.path ?? "").toLowerCase();
+		if (extension === ".gif") return "gif";
+		if (extension === ".webm") return "webm";
+		return "mp4";
+	}
+
+	private ffmpegArgs(format: RecordingFormat, fps: number, outputPath: string): string[] {
+		const args = ["-y", "-f", "image2pipe", "-vcodec", "png", "-framerate", String(fps), "-i", "pipe:0", "-an"];
+		if (format === "gif") {
+			return [...args, "-vf", `fps=${fps},scale=iw:-1:flags=lanczos`, outputPath];
+		}
+		const evenDimensions = "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+		if (format === "webm") {
+			return [...args, "-vf", evenDimensions, "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", "0", "-crf", "34", outputPath];
+		}
+		return [...args, "-vf", evenDimensions, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", outputPath];
+	}
+
+	private waitForSpawn(process: RecordingRecord["process"], ffmpegPath: string): Promise<void> {
+		return new Promise((resolve, reject) => {
+			process.once("spawn", resolve);
+			process.once("error", (error) => {
+				reject(new Error(`Failed to start ffmpeg (${ffmpegPath}). Install ffmpeg or pass ffmpegPath. ${(error as Error).message}`));
+			});
+		});
+	}
+
+	private async captureRecordingFrame(recording: RecordingRecord): Promise<void> {
+		if (!recording.active || recording.busy || recording.page.isClosed()) return;
+		recording.busy = true;
+		try {
+			const frame = await recording.page.screenshot({ type: "png", encoding: "binary" });
+			const stdin = recording.process.stdin;
+			if (!stdin?.writable) return;
+			if (!stdin.write(frame)) {
+				await new Promise<void>((resolve) => stdin.once("drain", resolve));
+			}
+			recording.frameCount += 1;
+		} catch (error) {
+			recording.stderr = truncate(`${recording.stderr}\n${(error as Error).message}`, 5000);
+		} finally {
+			recording.busy = false;
+		}
+	}
+
+	private resolveRecording(recordingId?: string, sessionId?: string, tabId?: string): RecordingRecord {
+		if (recordingId) {
+			const recording = this.recordings.get(recordingId);
+			if (!recording) throw new Error(`Unknown recording: ${recordingId}`);
+			return recording;
+		}
+
+		const candidates = [...this.recordings.values()].filter((recording) => {
+			if (!recording.active) return false;
+			if (sessionId && recording.sessionId !== sessionId) return false;
+			if (tabId && recording.tabId !== tabId) return false;
+			return true;
+		});
+		if (!candidates.length) throw new Error("No active recording matched the requested session/tab.");
+		if (candidates.length > 1) {
+			throw new Error(`Multiple active recordings matched; pass recordingId (${candidates.map((recording) => recording.id).join(", ")}).`);
+		}
+		return candidates[0]!;
+	}
+
+	private async stopSessionRecordings(sessionId: string, tabId?: string): Promise<void> {
+		const recordings = [...this.recordings.values()].filter((recording) => {
+			if (recording.sessionId !== sessionId) return false;
+			if (tabId && recording.tabId !== tabId) return false;
+			return true;
+		});
+		for (const recording of recordings) {
+			await this.stopRecording(recording).catch(() => undefined);
+			this.recordings.delete(recording.id);
+		}
+	}
+
+	private async stopRecording(recording: RecordingRecord): Promise<void> {
+		recording.active = false;
+		clearInterval(recording.timer);
+		while (recording.busy) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		if (recording.process.exitCode !== null) {
+			recording.exitCode = recording.process.exitCode;
+			return;
+		}
+		recording.process.stdin?.end();
+		let timedOut = false;
+		await new Promise<void>((resolve) => {
+			const timeout = setTimeout(() => {
+				timedOut = true;
+				recording.process.kill("SIGKILL");
+				resolve();
+			}, 10_000);
+			recording.process.once("exit", () => {
+				clearTimeout(timeout);
+				resolve();
+			});
+		});
+		recording.exitCode = timedOut ? -1 : recording.process.exitCode;
 	}
 
 	private displayPath(path: string): string {

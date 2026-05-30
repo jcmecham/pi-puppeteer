@@ -50,6 +50,8 @@ const BrowserToolSchema = Type.Object({
 			"extract_text",
 			"inspect",
 			"screenshot",
+			"record_start",
+			"record_stop",
 		] as const,
 	),
 	browserKey: Type.Optional(Type.String({ description: "Configured browser key, like chrome or edge; use system for the detected OS default browser" })),
@@ -60,7 +62,7 @@ const BrowserToolSchema = Type.Object({
 	selector: Type.Optional(Type.String({ description: "CSS selector for page actions" })),
 	text: Type.Optional(Type.String({ description: "Text content for type actions" })),
 	key: Type.Optional(Type.String({ description: "Keyboard key for press" })),
-	path: Type.Optional(Type.String({ description: "Output path for screenshots" })),
+	path: Type.Optional(Type.String({ description: "Output path for screenshots or recordings" })),
 	endpoint: Type.Optional(Type.String({ description: "Attach endpoint: browserURL or browserWSEndpoint" })),
 	headless: Type.Optional(Type.Boolean({ description: "Override launch headless mode" })),
 	timeoutMs: Type.Optional(Type.Number({ description: "Timeout override in milliseconds" })),
@@ -70,6 +72,10 @@ const BrowserToolSchema = Type.Object({
 	scrollX: Type.Optional(Type.Number({ description: "Horizontal scroll delta" })),
 	scrollY: Type.Optional(Type.Number({ description: "Vertical scroll delta" })),
 	executablePath: Type.Optional(Type.String({ description: "Explicit browser executable path override" })),
+	recordingId: Type.Optional(Type.String({ description: "Recording ID for record_stop" })),
+	format: Type.Optional(StringEnum(["mp4", "webm", "gif"] as const)),
+	fps: Type.Optional(Type.Number({ description: "Recording frame rate (default 10, max 30)" })),
+	ffmpegPath: Type.Optional(Type.String({ description: "ffmpeg executable path or command (default ffmpeg)" })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -128,8 +134,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "browser",
 		label: "Browser",
-		description: "Interact with a configured browser session. Supports launch, attach, navigation, clicks, typing, screenshots, text extraction, and inspection.",
-		promptSnippet: "Launch or attach to configured browsers, then navigate pages, interact with elements, inspect page state, and capture screenshots.",
+		description: "Interact with a configured browser session. Supports launch, attach, navigation, clicks, typing, screenshots, text extraction, inspection, and ffmpeg-backed page recording.",
+		promptSnippet: "Launch or attach to configured browsers, then navigate pages, interact with elements, inspect page state, capture screenshots, and record MP4/WebM/GIF browsing clips.",
 		promptGuidelines: [
 			"Use browser when the user wants Pi to interact with websites, tabs, forms, screenshots, or page inspection.",
 			"Use browser start or browser attach before page actions when no active browser session exists.",
