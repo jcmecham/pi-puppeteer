@@ -95,6 +95,7 @@ const WORKFLOW_RECORDING_WIDGET_KEY = "pi-puppeteer-workflow-recording";
 const WORKFLOW_RECORDING_STATUS_KEY = "pi-puppeteer-workflow";
 const BROWSER_SESSIONS_STATUS_KEY = "pi-puppeteer-sessions";
 const BROWSER_SESSIONS_WIDGET_KEY = "pi-puppeteer-sessions-widget";
+const BROWSER_MANAGER_SHORTCUT_HINT = " [Alt+B]";
 
 function recordingDot(ctx: WorkflowStatusUiContext, lit = true): string {
 	return ctx.ui.theme.fg(lit ? "error" : "dim", lit ? "●" : "○");
@@ -584,7 +585,7 @@ function setBrowserSessionsStatus(ctx: WorkflowStatusUiContext, count: number): 
 	if (!ctx.ui.setWidget) {
 		const label = ctx.ui.theme.fg("accent", count === 1 ? "Browser Session" : "Browser Sessions");
 		const total = ctx.ui.theme.fg("text", `: ${count}`);
-		const hint = ctx.ui.theme.fg("dim", " [Alt+P]");
+		const hint = ctx.ui.theme.fg("dim", BROWSER_MANAGER_SHORTCUT_HINT);
 		ctx.ui.setStatus(BROWSER_SESSIONS_STATUS_KEY, `${label}${total}${hint}`);
 		return;
 	}
@@ -592,7 +593,7 @@ function setBrowserSessionsStatus(ctx: WorkflowStatusUiContext, count: number): 
 		render(width: number): string[] {
 			const label = theme.fg("accent", count === 1 ? "Browser Session" : "Browser Sessions");
 			const total = theme.fg("text", `: ${count}`);
-			const hint = theme.fg("dim", " [Alt+P]");
+			const hint = theme.fg("dim", BROWSER_MANAGER_SHORTCUT_HINT);
 			return [joinColumns("", `${label}${total}${hint}`, width)];
 		},
 		invalidate(): void {},
@@ -888,7 +889,7 @@ class BrowserSessionsUiController {
 	}
 
 	private handleTerminalInput(data: string): { consume?: boolean; data?: string } | undefined {
-		if (data === "\x1bp" || data === "\x1bP") {
+		if (data === "\x1bb" || data === "\x1bB") {
 			void this.open();
 			return { consume: true };
 		}

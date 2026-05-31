@@ -192,7 +192,7 @@ workflow_details({ "workflowName": "login flow" })
 
 Saved workflow JSON and generated Puppeteer scripts live under `.pi/.pi-puppeteer/workflows/`. Use `/workflows` to open the workflow library UI for recording, replaying, renaming, exporting, and deleting saved workflows.
 
-Open browser sessions show up above the editor as a right-aligned `Browser Session(s): X` indicator when at least one session is open. Press `Alt+P` or run `/browser` to open the browser manager, open the default browser, change the project default browser with `B`, rename a selected browser, show a selected session, or close/detach a session. Browser manager entries use friendly names like `Browser-1` by default, and tool calls can pass `name` when starting or attaching a browser. For launch-mode sessions, `name` also becomes the default profile key unless you explicitly pass `profile`. Within one Pi session, launching the same browser/profile reuses the existing browser session instead of creating duplicates.
+Open browser sessions show up above the editor as a right-aligned `Browser Session(s): X` indicator when at least one session is open. Press `Alt+B` or run `/browser` to open the browser manager, open the default browser, change the project default browser with `B`, rename a selected browser, show a selected session, or close/detach a session. Browser manager entries use friendly names like `Browser-1` by default, and tool calls can pass `name` when starting or attaching a browser. For launch-mode sessions, `name` also becomes the default profile key unless you explicitly pass `profile`. Within one Pi session, launching the same browser/profile reuses the existing browser session instead of creating duplicates.
 
 Notes:
 
