@@ -1,6 +1,36 @@
 # pi-puppeteer
 
+[![CI](https://github.com/jcmecham/pi-puppeteer/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jcmecham/pi-puppeteer/actions/workflows/ci.yml)
+[![Release](https://github.com/jcmecham/pi-puppeteer/actions/workflows/publish.yml/badge.svg)](https://github.com/jcmecham/pi-puppeteer/actions/workflows/publish.yml)
+[![npm version](https://img.shields.io/npm/v/pi-puppeteer.svg)](https://www.npmjs.com/package/pi-puppeteer)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/jcmecham/pi-puppeteer/blob/main/LICENSE)
+[![Node >=22](https://img.shields.io/badge/node-%3E%3D22-339933.svg)](https://nodejs.org/)
+
 Pi extension package for browser automation with a browser-agnostic architecture.
+
+## Quick start
+
+Install for all Pi sessions:
+
+```bash
+pi install npm:pi-puppeteer
+```
+
+For local development from this repo:
+
+```bash
+npm install
+pi -e .
+pi install . -l
+```
+
+## Highlights
+
+- Chromium-first Pi browser automation built on `puppeteer-core`
+- Launch or attach flows for real installed browsers
+- Persistent Pi-managed browser profiles
+- Screenshots, text extraction, page inspection, and ffmpeg-backed recordings
+- Saved workflow recording, replay, export, and library management
 
 ## Current milestone
 
@@ -24,13 +54,13 @@ Key reasons:
 - `puppeteer-core` is library-only, so Pi can target **user-configured browsers** instead of assuming bundled browsers.
 - Existing agent-browser projects show that it is worth separating the **high-level action API** from the **browser transport layer**.
 
-See `docs/architecture.md` for the design rationale and research notes.
+See the [architecture notes](https://github.com/jcmecham/pi-puppeteer/blob/main/docs/architecture.md) for the design rationale and research notes.
 
-## Install dependencies
+## Requirements
 
-```bash
-npm install
-```
+- Node.js `>=22`
+- Pi with extension/package support
+- A Chromium-family browser installed for the current v1 feature set
 
 ## Package shape
 
@@ -38,20 +68,6 @@ This repo is a Pi package:
 
 - `package.json` declares the Pi manifest under `pi.extensions`
 - `src/index.ts` is the extension entry point
-
-## Load in Pi
-
-Project-local:
-
-```bash
-pi -e .
-```
-
-Or install it as a Pi package later:
-
-```bash
-pi install . -l
-```
 
 ## Configuration
 
@@ -214,6 +230,52 @@ Notes:
 - “Start a workflow recording named login, then replay it later.”
 - “Open `/workflows` and rename the checkout workflow.”
 - “Open `/browser` and close or detach the extra browser session.”
+
+## Project docs
+
+- [Architecture notes](https://github.com/jcmecham/pi-puppeteer/blob/main/docs/architecture.md)
+- [Contributing guide](https://github.com/jcmecham/pi-puppeteer/blob/main/CONTRIBUTING.md)
+- [Changelog](https://github.com/jcmecham/pi-puppeteer/blob/main/CHANGELOG.md)
+
+## Publish to npm
+
+This repo is set up for **automated npm publish from GitHub Releases**.
+
+### One-time setup
+
+Recommended: configure **npm trusted publishing** for this GitHub repository in the npm package settings. That lets the `publish` workflow publish without a long-lived token.
+
+If you prefer the older token-based approach, add an `NPM_TOKEN` repository secret in GitHub instead.
+
+### Release flow
+
+1. Update `CHANGELOG.md`.
+2. Bump the package version:
+
+```bash
+npm version patch
+```
+
+3. Push the commit and tag:
+
+```bash
+git push && git push --tags
+```
+
+4. Create or publish a GitHub Release for that tag.
+5. GitHub Actions runs `.github/workflows/publish.yml` and publishes to npm.
+
+You can locally preview the release bundle any time with:
+
+```bash
+npm run publish:check
+```
+
+After publish, install it globally in Pi with:
+
+```bash
+pi install npm:pi-puppeteer
+```
 
 ## Development checks
 

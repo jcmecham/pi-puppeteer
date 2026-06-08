@@ -1,9 +1,18 @@
 {
   "name": "pi-puppeteer",
   "version": "0.1.0",
-  "private": true,
   "description": "Pi extension package for browser-agnostic automation with Puppeteer-core, Chromium-first and Firefox-ready architecture.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jcmecham/pi-puppeteer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jcmecham/pi-puppeteer/issues"
+  },
+  "homepage": "https://github.com/jcmecham/pi-puppeteer#readme",
   "type": "module",
+  "packageManager": "npm@11.13.0",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -17,8 +26,12 @@
     "docs",
     "scripts/configure.ts",
     "README.md",
+    "CHANGELOG.md",
     "tsconfig.json"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -29,7 +42,9 @@
     "build": "npm run check",
     "check": "tsc --noEmit",
     "validate": "npm run clean && npm run check",
-    "configure": "tsx scripts/configure.ts"
+    "publish:check": "npm run validate && npm pack --dry-run",
+    "configure": "tsx scripts/configure.ts",
+    "prepublishOnly": "npm run validate"
   },
   "engines": {
     "node": ">=22"
