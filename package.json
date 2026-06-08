@@ -1,6 +1,6 @@
 {
   "name": "pi-puppeteer",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Pi extension package for browser-agnostic automation with Puppeteer-core, Chromium-first and Firefox-ready architecture.",
   "license": "MIT",
   "repository": {
