@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { BrowserManager } from "./manager.ts";
@@ -232,6 +232,38 @@ type RecordingScreenComponent = {
 	invalidate(): void;
 };
 
+type SelectKeyAction = "up" | "down" | "confirm" | "cancel";
+
+const SELECT_KEYBINDINGS: Record<SelectKeyAction, "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel"> = {
+	up: "tui.select.up",
+	down: "tui.select.down",
+	confirm: "tui.select.confirm",
+	cancel: "tui.select.cancel",
+};
+
+function matchSelectKey(data: string, keybindings: KeybindingsManager): SelectKeyAction | undefined {
+	for (const action of ["up", "down", "confirm", "cancel"] as const) {
+		if (keybindings.matches(data, SELECT_KEYBINDINGS[action])) return action;
+	}
+	return undefined;
+}
+
+function printableShortcut(data: string): string | undefined {
+	if (data.length === 1) return data.toLowerCase();
+
+	// Kitty/CSI-u printable keys are encoded as ESC [ <unicode codepoint> ; <modifiers> u.
+	// Keep this intentionally small: it only extends existing one-letter shortcuts.
+	const csiUMatch = data.match(/^\x1b\[(\d+)(?:;\d+)?u$/);
+	if (!csiUMatch) return undefined;
+	const codePoint = Number(csiUMatch[1]);
+	if (!Number.isInteger(codePoint) || codePoint < 32 || codePoint > 126) return undefined;
+	return String.fromCodePoint(codePoint).toLowerCase();
+}
+
+function matchesShortcut(data: string, shortcut: string): boolean {
+	return printableShortcut(data) === shortcut.toLowerCase();
+}
+
 async function showWorkflowRecordingScreen(
 	ctx: ExtensionContext,
 	browserManager: BrowserManager,
@@ -261,7 +293,7 @@ async function showWorkflowRecordingScreen(
 
 	const timer = setInterval(() => void refresh(), 500);
 	try {
-		return await ctx.ui.custom<"stop" | "background">((tui, theme, _keybindings, done) => {
+		return await ctx.ui.custom<"stop" | "background">((tui, theme, keybindings, done) => {
 			requestRender = () => tui.requestRender();
 			component = {
 				render(width: number): string[] {
@@ -301,8 +333,9 @@ async function showWorkflowRecordingScreen(
 					return lines.map((line) => truncateAnsi(line, width));
 				},
 				handleInput(data: string): void {
-					if (data === "\r" || data === "\n") done("stop");
-					if (data === "\x1b") done("background");
+					const selectKey = matchSelectKey(data, keybindings);
+					if (selectKey === "confirm") done("stop");
+					if (selectKey === "cancel") done("background");
 				},
 				invalidate(): void {},
 			};
@@ -328,7 +361,7 @@ async function showWorkflowLibraryScreen(
 	let requestRender: (() => void) | undefined;
 	let component: RecordingScreenComponent | undefined;
 
-	return ctx.ui.custom<WorkflowLibraryAction>((tui, theme, _keybindings, done) => {
+	return ctx.ui.custom<WorkflowLibraryAction>((tui, theme, keybindings, done) => {
 		requestRender = () => tui.requestRender();
 		component = {
 			render(width: number): string[] {
@@ -391,25 +424,26 @@ async function showWorkflowLibraryScreen(
 			invalidate(): void {},
 			handleInput(data: string): void {
 				const selected = workflows[selectedIndex];
-				if (data === "\x1b[A") {
+				const selectKey = matchSelectKey(data, keybindings);
+				if (selectKey === "up") {
 					if (!workflows.length) return;
 					selectedIndex = Math.max(0, selectedIndex - 1);
 					deleteArmed = false;
 					requestRender?.();
 					return;
 				}
-				if (data === "\x1b[B") {
+				if (selectKey === "down") {
 					if (!workflows.length) return;
 					selectedIndex = Math.min(workflows.length - 1, selectedIndex + 1);
 					deleteArmed = false;
 					requestRender?.();
 					return;
 				}
-				if (data === "n" || data === "N") {
+				if (matchesShortcut(data, "n")) {
 					done({ type: "start" });
 					return;
 				}
-				if (data === "\x1b" || data === "\x03") {
+				if (selectKey === "cancel") {
 					if (deleteArmed) {
 						deleteArmed = false;
 						requestRender?.();
@@ -419,19 +453,19 @@ async function showWorkflowLibraryScreen(
 					return;
 				}
 				if (!selected) return;
-				if (data === "\r" || data === "\n") {
+				if (selectKey === "confirm") {
 					done({ type: "replay", workflow: selected });
 					return;
 				}
-				if (data === "r" || data === "R") {
+				if (matchesShortcut(data, "r")) {
 					done({ type: "rename", workflow: selected });
 					return;
 				}
-				if (data === "e" || data === "E") {
+				if (matchesShortcut(data, "e")) {
 					done({ type: "export", workflow: selected });
 					return;
 				}
-				if (data === "d" || data === "D") {
+				if (matchesShortcut(data, "d")) {
 					if (deleteArmed) {
 						done({ type: "delete", workflow: selected });
 						return;
@@ -611,7 +645,7 @@ async function showBrowserSessionsScreen(
 	let requestRender: (() => void) | undefined;
 	let component: RecordingScreenComponent | undefined;
 
-	return ctx.ui.custom<SessionManagerAction>((tui, theme, _keybindings, done) => {
+	return ctx.ui.custom<SessionManagerAction>((tui, theme, keybindings, done) => {
 		requestRender = () => tui.requestRender();
 		component = {
 			render(width: number): string[] {
@@ -715,29 +749,30 @@ async function showBrowserSessionsScreen(
 			invalidate(): void {},
 			handleInput(data: string): void {
 				const selected = sessions[selectedIndex];
-				if (data === "n" || data === "N") {
+				const selectKey = matchSelectKey(data, keybindings);
+				if (matchesShortcut(data, "n")) {
 					done({ type: "create" });
 					return;
 				}
-				if (data === "b" || data === "B") {
+				if (matchesShortcut(data, "b")) {
 					done({ type: "change-default-browser" });
 					return;
 				}
-				if (data === "\x1b[A") {
+				if (selectKey === "up") {
 					if (!sessions.length) return;
 					selectedIndex = Math.max(0, selectedIndex - 1);
 					closeArmed = false;
 					requestRender?.();
 					return;
 				}
-				if (data === "\x1b[B") {
+				if (selectKey === "down") {
 					if (!sessions.length) return;
 					selectedIndex = Math.min(sessions.length - 1, selectedIndex + 1);
 					closeArmed = false;
 					requestRender?.();
 					return;
 				}
-				if (data === "\x1b" || data === "\x03") {
+				if (selectKey === "cancel") {
 					if (closeArmed) {
 						closeArmed = false;
 						requestRender?.();
@@ -747,15 +782,15 @@ async function showBrowserSessionsScreen(
 					return;
 				}
 				if (!selected) return;
-				if (data === "\r" || data === "\n") {
+				if (selectKey === "confirm") {
 					done({ type: "show", session: selected });
 					return;
 				}
-				if (data === "r" || data === "R") {
+				if (matchesShortcut(data, "r")) {
 					done({ type: "rename", session: selected });
 					return;
 				}
-				if (data === "d" || data === "D") {
+				if (matchesShortcut(data, "d")) {
 					if (closeArmed) {
 						done({ type: "close", session: selected });
 						return;
