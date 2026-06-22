@@ -39,9 +39,16 @@ interface ToolResponse {
 	details: Record<string, unknown>;
 }
 
+interface RemovedSessionRecord {
+	id: string;
+	name: string;
+	removedAt: number;
+}
+
 const require = createRequire(import.meta.url);
 const bundledFfmpegPath = require("ffmpeg-static") as string | null;
 const WORKFLOW_RECORDER_FUNCTION = "__piPuppeteerWorkflowRecord";
+const RECENTLY_REMOVED_SESSION_TTL_MS = 5 * 60 * 1000;
 
 function truncate(value: string, max = 4000): string {
 	return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
@@ -54,6 +61,7 @@ function sanitizeSegment(value: string | undefined, fallback: string): string {
 
 export class BrowserManager {
 	private sessions = new Map<string, BrowserSessionRecord>();
+	private recentlyRemovedSessions = new Map<string, RemovedSessionRecord>();
 	private recordings = new Map<string, RecordingRecord>();
 	private workflowRecordings = new Map<string, WorkflowRecordingRecord>();
 	private workflowRecorderInjectedPages = new WeakSet<Page>();
@@ -323,12 +331,26 @@ export class BrowserManager {
 	}
 
 	private async stop(sessionId?: string): Promise<ToolResponse> {
-		const session = this.resolveSession(sessionId);
+		const resolvedId = sessionId ?? this.currentSessionId;
+		if (!resolvedId) {
+			throw new Error("No browser session is open. Start or attach to a browser first.");
+		}
+		const session = this.sessions.get(resolvedId);
+		if (!session) {
+			const removedSession = this.recentlyRemovedSession(resolvedId);
+			if (removedSession) {
+				return {
+					text: `${removedSession.name} (${removedSession.id}) is already closed.`,
+					details: { action: "stop", sessionId: removedSession.id, alreadyClosed: true },
+				};
+			}
+			throw new Error(`Unknown browser session: ${resolvedId}`);
+		}
 		await this.stopSession(session);
 		this.removeSession(session.id);
 		return {
 			text: session.mode === "attach" ? `Detached from ${session.id}.` : `Stopped ${session.id}.`,
-			details: { action: "stop", sessionId: session.id },
+			details: { action: "stop", sessionId: session.id, alreadyClosed: false },
 		};
 	}
 
@@ -1362,13 +1384,38 @@ export class BrowserManager {
 	}
 
 	private removeSession(sessionId: string): void {
-		if (!this.sessions.has(sessionId)) return;
+		const session = this.sessions.get(sessionId);
+		if (!session) return;
+		this.rememberRemovedSession(session);
 		this.sessions.delete(sessionId);
 		if (this.currentSessionId === sessionId) {
 			this.currentSessionId = this.sessions.keys().next().value;
 		}
 		void this.stopSessionRecordings(sessionId).catch(() => undefined);
 		void this.stopSessionWorkflowRecordings(sessionId).catch(() => undefined);
+	}
+
+	private rememberRemovedSession(session: BrowserSessionRecord): void {
+		this.pruneRecentlyRemovedSessions();
+		this.recentlyRemovedSessions.set(session.id, {
+			id: session.id,
+			name: session.name,
+			removedAt: Date.now(),
+		});
+	}
+
+	private recentlyRemovedSession(sessionId: string): RemovedSessionRecord | undefined {
+		this.pruneRecentlyRemovedSessions();
+		return this.recentlyRemovedSessions.get(sessionId);
+	}
+
+	private pruneRecentlyRemovedSessions(): void {
+		const expiresBefore = Date.now() - RECENTLY_REMOVED_SESSION_TTL_MS;
+		for (const [sessionId, session] of this.recentlyRemovedSessions.entries()) {
+			if (session.removedAt < expiresBefore) {
+				this.recentlyRemovedSessions.delete(sessionId);
+			}
+		}
 	}
 
 	private resolveRecordingFormat(input: BrowserToolInput): RecordingFormat {

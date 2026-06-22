@@ -845,7 +845,9 @@ async function openBrowserSessionsManager(
 		const sessions = ((result.details.sessions as SessionSummary[] | undefined) ?? []);
 		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId, async (session) => {
 			const stopped = await browserManager.execute({ action: "stop", sessionId: session.id });
-			ctx.ui.notify(stopped.text, "info");
+			if (!stopped.details.alreadyClosed) {
+				ctx.ui.notify(stopped.text, "info");
+			}
 			await onChange?.();
 			const refreshed = await browserManager.execute({ action: "sessions" });
 			const nextSessions = ((refreshed.details.sessions as SessionSummary[] | undefined) ?? []);
