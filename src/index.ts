@@ -639,14 +639,32 @@ async function showBrowserSessionsScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
 	sessions: SessionSummary[],
 	preferredSessionId?: string,
+	onCloseSession?: (session: SessionSummary) => Promise<SessionSummary[]>,
 ): Promise<SessionManagerAction> {
 	let selectedIndex = Math.max(0, sessions.findIndex((session) => session.id === preferredSessionId || (!preferredSessionId && session.current)));
 	let closeArmed = false;
+	let closeInProgress = false;
 	let requestRender: (() => void) | undefined;
 	let component: RecordingScreenComponent | undefined;
 
 	return ctx.ui.custom<SessionManagerAction>((tui, theme, keybindings, done) => {
 		requestRender = () => tui.requestRender();
+		const closeSelectedSession = async (session: SessionSummary) => {
+			if (!onCloseSession || closeInProgress) return;
+			closeInProgress = true;
+			requestRender?.();
+			try {
+				sessions = await onCloseSession(session);
+				selectedIndex = sessions.length ? Math.min(selectedIndex, sessions.length - 1) : 0;
+				closeArmed = false;
+			} catch (error) {
+				closeArmed = false;
+				ctx.ui.notify((error as Error).message, "error");
+			} finally {
+				closeInProgress = false;
+				requestRender?.();
+			}
+		};
 		component = {
 			render(width: number): string[] {
 				const minWidth = Math.max(24, width);
@@ -719,26 +737,28 @@ async function showBrowserSessionsScreen(
 
 				const stopActionLabel = selected?.mode === "attach" ? "detach" : "close";
 				const confirmStopActionLabel = selected?.mode === "attach" ? "confirm detach" : "confirm close";
-				const controls = !sessions.length
-					? [
-						`${workflowKeycap(theme, "N", "accent")} open`,
-						`${workflowKeycap(theme, "B", "accent")} change default browser`,
-						`${workflowKeycap(theme, "Esc")} back`,
-					].join(theme.fg("dim", "  "))
-					: closeArmed
+				const controls = closeInProgress
+					? theme.fg("warning", selected?.mode === "attach" ? "Detaching browser…" : "Closing browser…")
+					: !sessions.length
 						? [
-							`${workflowKeycap(theme, "D", "warning")} ${confirmStopActionLabel}`,
-							`${workflowKeycap(theme, "Esc")} cancel`,
-						].join(theme.fg("dim", "  "))
-						: [
-							`${workflowKeycap(theme, "↑↓")} move`,
-							`${workflowKeycap(theme, "Enter", "accent")} show`,
-							`${workflowKeycap(theme, "N", "accent")} new`,
-							`${workflowKeycap(theme, "R", "accent")} rename`,
-							`${workflowKeycap(theme, "D", "accent")} ${stopActionLabel}`,
+							`${workflowKeycap(theme, "N", "accent")} open`,
 							`${workflowKeycap(theme, "B", "accent")} change default browser`,
 							`${workflowKeycap(theme, "Esc")} back`,
-						].join(theme.fg("dim", "  "));
+						].join(theme.fg("dim", "  "))
+						: closeArmed
+							? [
+								`${workflowKeycap(theme, "D", "warning")} ${confirmStopActionLabel}`,
+								`${workflowKeycap(theme, "Esc")} cancel`,
+							].join(theme.fg("dim", "  "))
+							: [
+								`${workflowKeycap(theme, "↑↓")} move`,
+								`${workflowKeycap(theme, "Enter", "accent")} show`,
+								`${workflowKeycap(theme, "N", "accent")} new`,
+								`${workflowKeycap(theme, "R", "accent")} rename`,
+								`${workflowKeycap(theme, "D", "accent")} ${stopActionLabel}`,
+								`${workflowKeycap(theme, "B", "accent")} change default browser`,
+								`${workflowKeycap(theme, "Esc")} back`,
+							].join(theme.fg("dim", "  "));
 				lines.push(
 					boxed(""),
 					boxed(controls),
@@ -750,6 +770,7 @@ async function showBrowserSessionsScreen(
 			handleInput(data: string): void {
 				const selected = sessions[selectedIndex];
 				const selectKey = matchSelectKey(data, keybindings);
+				if (closeInProgress) return;
 				if (matchesShortcut(data, "n")) {
 					done({ type: "create" });
 					return;
@@ -792,7 +813,11 @@ async function showBrowserSessionsScreen(
 				}
 				if (matchesShortcut(data, "d")) {
 					if (closeArmed) {
-						done({ type: "close", session: selected });
+						if (onCloseSession) {
+							void closeSelectedSession(selected);
+						} else {
+							done({ type: "close", session: selected });
+						}
 						return;
 					}
 					closeArmed = true;
@@ -818,7 +843,15 @@ async function openBrowserSessionsManager(
 		browserManager.setConfig(config);
 		const result = await browserManager.execute({ action: "sessions" });
 		const sessions = ((result.details.sessions as SessionSummary[] | undefined) ?? []);
-		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId);
+		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId, async (session) => {
+			const stopped = await browserManager.execute({ action: "stop", sessionId: session.id });
+			ctx.ui.notify(stopped.text, "info");
+			await onChange?.();
+			const refreshed = await browserManager.execute({ action: "sessions" });
+			const nextSessions = ((refreshed.details.sessions as SessionSummary[] | undefined) ?? []);
+			selectedSessionId = nextSessions.find((candidate) => candidate.current)?.id ?? nextSessions[0]?.id;
+			return nextSessions;
+		});
 		if (action.type === "exit") return;
 		if ("session" in action) selectedSessionId = action.session.id;
 		try {
