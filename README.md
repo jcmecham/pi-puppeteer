@@ -24,6 +24,7 @@ Use it to ask Pi to:
 - open or attach to a browser
 - navigate pages and manage tabs
 - click, type, press keys, scroll, and wait for elements
+- emulate mobile devices or set a custom viewport (touch, mobile UA, DPR)
 - extract page text or inspect page structure
 - capture full-page screenshots
 - record MP4, WebM, or GIF clips of a tab viewport
@@ -46,6 +47,7 @@ After installation, you can ask Pi things like:
 - “Click the sign in button in the current browser session.”
 - “Inspect this page and summarize the headings, forms, and links.”
 - “Take a full-page screenshot and save it as `artifacts/home.png`.”
+- “Emulate an iPhone 13 and screenshot the page.”
 - “Record a short GIF while you scroll through the page.”
 - “Start a workflow recording named `login`, then replay it later.”
 
