@@ -24,7 +24,7 @@ Use it to ask Pi to:
 - open or attach to a browser
 - navigate pages and manage tabs
 - click, type, press keys, scroll, and wait for elements
-- emulate mobile devices or set a custom viewport (touch, mobile UA, DPR)
+- emulate mobile devices or set a custom viewport (touch, UA override, DPR)
 - extract page text or inspect page structure
 - capture full-page screenshots
 - record MP4, WebM, or GIF clips of a tab viewport
