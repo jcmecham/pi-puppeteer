@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Handled stale browser session closes gracefully.
 - Kept the browser manager open after closing sessions.
-- Fixed custom TUI key handling.
+- Fixed custom TUI key handling in the browser manager.
 - Fixed the npm trusted publishing workflow.
 
 ### Changed
@@ -32,7 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Prepared the 0.1.3 release metadata.
+- Bumped package metadata for the 0.1.3 release.
 
 ## [0.1.2] - 2026-06-07
 
@@ -44,15 +44,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added system default browser resolution for launch flows.
+- Added ffmpeg-backed browser recording support.
+- Added workflow recording, replay, export, rename, delete, and library management.
+- Added browser session manager UI and session reuse support.
 - Added publish-ready package metadata, MIT license, release validation script, CI workflow, README badges, automated npm publish workflow, and contributor documentation.
+
+### Changed
+
+- Polished the browser manager default-browser experience.
+- Updated browser manager shortcut hints from `Alt+P` to `Alt+B`.
 
 ## [0.1.0] - 2026-06-07
 
 ### Added
 
 - Initial Pi package for browser automation built on `puppeteer-core`.
-- Chromium-family browser discovery, launch, and attach flows.
-- Browser session and tab management.
-- Page navigation, interaction, inspection, text extraction, screenshots, and recordings.
-- Workflow recording, replay, export, rename, delete, and library management.
-- Project-scoped browser profiles, artifacts, and settings.
+- Added Chromium-family browser discovery, launch, and attach flows.
+- Added browser session and tab management.
+- Added page navigation, interaction, inspection, text extraction, and screenshot support.
+- Added project-scoped browser profiles, artifacts, and settings.
