@@ -24,6 +24,7 @@ export type BrowserAction =
 	| "type"
 	| "press"
 	| "scroll"
+	| "emulate"
 	| "wait_for"
 	| "extract_text"
 	| "inspect"
@@ -114,6 +115,13 @@ export interface BrowserToolInput {
 	fullPage?: boolean;
 	scrollX?: number;
 	scrollY?: number;
+	device?: string;
+	width?: number;
+	height?: number;
+	isMobile?: boolean;
+	hasTouch?: boolean;
+	deviceScaleFactor?: number;
+	userAgent?: string;
 	executablePath?: string;
 	recordingId?: string;
 	format?: RecordingFormat;

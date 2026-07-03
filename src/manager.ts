@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Browser, Page } from "puppeteer-core";
+import { KnownDevices } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
 import {
 	createWorkflowId,
@@ -127,6 +128,8 @@ export class BrowserManager {
 				return this.press(input);
 			case "scroll":
 				return this.scroll(input);
+			case "emulate":
+				return this.emulate(input);
 			case "wait_for":
 				return this.waitFor(input);
 			case "extract_text":
@@ -506,6 +509,44 @@ export class BrowserManager {
 		return {
 			text: `Scrolled ${session.id}/${session.currentPageId} to (${position.x}, ${position.y}).`,
 			details: { action: "scroll", sessionId: session.id, tabId: session.currentPageId, position },
+		};
+	}
+
+	private async emulate(input: BrowserToolInput): Promise<ToolResponse> {
+		const session = this.resolveSession(input.sessionId);
+		const page = await this.resolvePage(session, input.tabId);
+
+		// Device preset (touch + UA + DPR + viewport) or manual viewport override.
+		// Runs over CDP (Emulation.setDeviceMetricsOverride), like DevTools device mode:
+		// it does not resize the physical window, so it is safe in attach mode too.
+		if (input.device) {
+			const known = (KnownDevices as Record<string, Parameters<typeof page.emulate>[0]>)[input.device];
+			if (!known) {
+				const available = Object.keys(KnownDevices).join(", ");
+				throw new Error(`Unknown device "${input.device}". Available: ${available}`);
+			}
+			await page.emulate(known);
+			return {
+				text: `Emulating "${input.device}" on ${session.id}/${session.currentPageId}.`,
+				details: { action: "emulate", sessionId: session.id, tabId: session.currentPageId, device: input.device },
+			};
+		}
+
+		if (input.width === undefined || input.height === undefined) {
+			throw new Error("emulate requires either a device preset or both width and height.");
+		}
+		const viewport = {
+			width: input.width,
+			height: input.height,
+			isMobile: input.isMobile ?? false,
+			hasTouch: input.hasTouch ?? input.isMobile ?? false,
+			deviceScaleFactor: input.deviceScaleFactor ?? 1,
+		};
+		await page.setViewport(viewport);
+		if (input.userAgent) await page.setUserAgent(input.userAgent);
+		return {
+			text: `Set viewport ${input.width}x${input.height} on ${session.id}/${session.currentPageId}.`,
+			details: { action: "emulate", sessionId: session.id, tabId: session.currentPageId, viewport, userAgent: input.userAgent ?? null },
 		};
 	}
 
