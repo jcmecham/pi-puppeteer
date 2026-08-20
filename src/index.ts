@@ -191,6 +191,9 @@ function padAnsiEnd(value: string, width: number): string {
 
 function joinColumns(left: string, right: string, width: number): string {
 	const rightWidth = stripAnsi(right).length;
+	if (rightWidth >= width) {
+		return truncateAnsi(right, width);
+	}
 	const leftWidth = Math.max(0, width - rightWidth - 1);
 	const renderedLeft = truncateAnsi(left, leftWidth);
 	return `${renderedLeft}${" ".repeat(Math.max(1, width - stripAnsi(renderedLeft).length - rightWidth))}${right}`;
