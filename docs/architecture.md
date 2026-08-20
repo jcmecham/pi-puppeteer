@@ -133,7 +133,7 @@ Project config overrides global config.
 The config should support:
 
 - default browser key
-- profile root
+- profile scope (`global` or `project`) and an explicit profile root override
 - artifact root
 - default timeout / headless / waitUntil
 - browser definitions
@@ -145,14 +145,59 @@ The config should support:
 
 ## 4. Profile model
 
-Named profiles are stored on disk under a Pi-managed folder.
+Named profiles are stored on disk under a Pi-managed folder, outside any project directory.
 
 Example:
 
-- `.pi/.pi-puppeteer/profiles/chrome/default`
-- `.pi/.pi-puppeteer/profiles/edge/work`
+- `~/.pi/agent/extensions/pi-puppeteer/profiles/chrome/default`
+- `~/.pi/agent/extensions/pi-puppeteer/profiles/edge/work`
 
 This gives persistent login/session state without requiring the extension to reuse a user’s personal everyday browser profile.
+
+Profiles were project-local through 0.2.x. They moved for three reasons: a profile holds cookies and
+session tokens and so must never sit where `git add -A` can reach it; a single Chromium profile runs
+to hundreds of megabytes across thousands of cache files, duplicated per project; and a per-project
+profile forces a fresh sign-in for every repository.
+
+Profiles are keyed by name, not by project, so the same name means the same profile everywhere. The
+profile name is taken from the `profile` input and defaults to `default`. It is deliberately *not*
+derived from the session label — labels are auto-generated (`Browser-1`, `Browser-2`), so deriving
+from them would make unrelated projects collide by default.
+
+Set `profileScope: "project"` to restore the old layout.
+
+## 4a. Storage layout and migration
+
+Two roots, split by what the data is:
+
+- **project** — `<cwd>/.pi/.pi-puppeteer/`: `settings.json`, `artifacts/`, `workflows/`. Created
+  lazily, on first write, and carries a `.gitignore` of `*` / `!.gitignore`.
+- **global** — `<agentDir>/extensions/pi-puppeteer/`: `profiles/`.
+
+Legacy project profiles migrate on the first `loadConfig` that resolves to the global root, memoized
+per project for the process lifetime. The rules that matter:
+
+- **Never merge.** A profile is moved whole with `renameSync`, or not at all. Two same-named profiles
+  from different projects would otherwise interleave their `Cookies`, `Local State`, `Preferences`,
+  and IndexedDB and corrupt both. First project to migrate wins; the rest are reported and left.
+- **Only `EXDEV` earns a copy.** `EPERM`/`EBUSY`/`EACCES` mean a browser holds the profile open, so
+  migration defers and retries on a later session rather than copying live files.
+- **Cross-volume copies stage and swap.** The copy lands beside the target and is renamed into place,
+  so a target directory never exists half-written.
+
+## 4b. Profile ownership across processes
+
+Chromium allows one browser process per `--user-data-dir`; a second launch forwards its command line
+to the running instance and exits. With profiles shared across projects, two Pi sessions can want the
+same profile, so a session records ownership inside the user data dir (`.pi-puppeteer-owner.json`:
+pid, host, state, DevTools URL).
+
+- A session finding a live owner **adopts** that browser: it connects, and on teardown disconnects
+  rather than closing or reaping.
+- Liveness is always confirmed by a real request to the DevTools endpoint. A pid alone is not enough,
+  because Windows recycles pids.
+- Process reaping sweeps by user data dir **only** while this process owns the profile, and matches
+  the whole `--user-data-dir` argument — a prefix match would let `.../default` reap `.../default-2`.
 
 ## 5. Session model
 
@@ -164,6 +209,7 @@ Each session tracks:
 - engine
 - connection mode (`launch` or `attach`)
 - profile name when relevant
+- whether the browser was adopted from another process, which decides between disconnect and close on teardown
 - current tab ID
 - tab map
 
@@ -227,6 +273,8 @@ This keeps normal Pi tool actions and manual headed-browser interactions in the 
 - OS-level browser chrome/window recording (current recording captures the page viewport)
 - remote/cloud browser providers
 - login/session import from personal browser profiles
+- merging two same-named browser profiles from different projects
+- per-project isolation of a shared profile (use a distinct `profile` name instead)
 
 ## 9. Firefox plan
 

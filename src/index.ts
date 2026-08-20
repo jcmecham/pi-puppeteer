@@ -1,22 +1,61 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadConfig } from "./config.ts";
+import { ensureStorageDir, loadConfig } from "./config.ts";
 import { BrowserManager } from "./manager.ts";
 import type { BrowserToolInput, RawExtensionConfig, ResolvedConfig, SessionSummary, WorkflowStep } from "./types.ts";
 
-async function writeProjectDefaultBrowser(config: ResolvedConfig, browserKey: string): Promise<void> {
+async function writeProjectDefaultBrowser(cwd: string, config: ResolvedConfig, browserKey: string): Promise<void> {
 	const projectConfigPath = config.configPaths.project;
 	const existing: RawExtensionConfig = existsSync(projectConfigPath)
 		? (JSON.parse(readFileSync(projectConfigPath, "utf8")) as RawExtensionConfig)
 		: {};
 
 	existing.defaultBrowser = browserKey;
-	await mkdir(dirname(projectConfigPath), { recursive: true });
+	ensureStorageDir(cwd, dirname(projectConfigPath));
 	await writeFile(projectConfigPath, `${JSON.stringify(existing, null, 2)}\n`, "utf8");
+}
+
+/**
+ * Surface the one-time profile relocation. `loadConfig` runs on nearly every command but only reports
+ * on the run that actually moved something, so this is safe to call once per session start.
+ */
+function reportProfileMigration(ctx: ExtensionContext, config: ResolvedConfig): void {
+	const migration = config.profileMigration;
+	if (!migration) return;
+
+	if (migration.moved.length) {
+		ctx.ui.notify(
+			`pi-puppeteer moved ${migration.moved.length} browser profile(s) out of this project into ${config.profileRoot}. ` +
+				"Profiles hold cookies and session tokens, so they are no longer written into your repository.",
+			"info",
+		);
+	}
+
+	const conflicts = migration.pending.filter((entry) => entry.reason === "target-exists");
+	if (conflicts.length) {
+		ctx.ui.notify(
+			`Left ${conflicts.length} profile(s) in place: a profile of the same name already exists in the shared root. ` +
+				`They were not merged. Start a session with a different \`profile\` name to keep them, or delete ${conflicts[0]?.source} once you no longer need it.`,
+			"error",
+		);
+	}
+
+	const locked = migration.pending.filter((entry) => entry.reason === "locked");
+	if (locked.length) {
+		ctx.ui.notify(
+			`Deferred ${locked.length} profile(s): a browser still has them open. Close it and restart Pi to finish the move.`,
+			"info",
+		);
+	}
+
+	const failed = migration.pending.filter((entry) => entry.reason === "failed");
+	if (failed.length) {
+		ctx.ui.notify(`Could not move ${failed.length} profile(s); they were left untouched at ${failed[0]?.source}.`, "error");
+	}
 }
 
 function browserOptionLabel(key: string, definition: ResolvedConfig["browsers"][string], currentSetting: string): string {
@@ -860,7 +899,7 @@ async function openBrowserSessionsManager(
 			if (action.type === "change-default-browser") {
 				const selectedKey = await chooseDefaultBrowser(ctx, config);
 				if (!selectedKey) continue;
-				await writeProjectDefaultBrowser(config, selectedKey);
+				await writeProjectDefaultBrowser(ctx.cwd, config, selectedKey);
 				const nextConfig = loadConfig(ctx.cwd);
 				browserManager.setConfig(nextConfig);
 				const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
@@ -869,7 +908,13 @@ async function openBrowserSessionsManager(
 				const existingNames = new Set(sessions.map((session) => session.name.toLowerCase()));
 				let suggestedNumber = 1;
 				while (existingNames.has(`browser-${suggestedNumber}`)) suggestedNumber += 1;
-				const started = await browserManager.execute({ action: "start", name: `Browser-${suggestedNumber}` });
+				// The first window in a project uses the shared "default" profile; extra windows get
+				// their own, since one browser process can only hold one user-data-dir open.
+				const started = await browserManager.execute({
+					action: "start",
+					name: `Browser-${suggestedNumber}`,
+					profile: suggestedNumber === 1 ? undefined : `browser-${suggestedNumber}`,
+				});
 				const session = started.details.session as SessionSummary | undefined;
 				selectedSessionId = session?.id;
 				ctx.ui.notify(started.text, "info");
@@ -1065,7 +1110,9 @@ export default function (pi: ExtensionAPI) {
 	let sessionsUi: BrowserSessionsUiController | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
-		manager = new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
+		const startupConfig = loadConfig(ctx.cwd);
+		manager = new BrowserManager(ctx.cwd, startupConfig);
+		reportProfileMigration(ctx, startupConfig);
 		workflowUi = new WorkflowRecordingUiController(ctx, () => {
 			manager ??= new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
 			return manager;

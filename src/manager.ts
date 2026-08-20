@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Browser, Page } from "puppeteer-core";
 import { KnownDevices } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
+import { ensureStorageDir } from "./config.ts";
 import {
 	createWorkflowId,
 	deleteWorkflow,
@@ -55,9 +56,22 @@ function truncate(value: string, max = 4000): string {
 	return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
 }
 
+// Profile names become path segments under a shared root, so `.` and `..` must never survive: a
+// profile named ".." would resolve outside the profile root and into the Pi agent directory.
 function sanitizeSegment(value: string | undefined, fallback: string): string {
 	const base = (value ?? fallback).trim() || fallback;
-	return base.replace(/[^a-zA-Z0-9._-]+/g, "-");
+	const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "");
+	return cleaned || fallback;
+}
+
+// Profile roots are now shared and live under the Pi agent directory, so a crafted segment escaping
+// the root would land in Pi's own configuration. Sanitizing is the first line of defence; this is the
+// second.
+function assertInsideRoot(root: string, candidate: string): void {
+	const prefix = resolve(root) + sep;
+	if (!resolve(candidate).startsWith(prefix)) {
+		throw new Error("Resolved profile path escapes the profile root.");
+	}
 }
 
 export class BrowserManager {
@@ -211,8 +225,13 @@ export class BrowserManager {
 		}
 
 		const requestedName = this.normalizeSessionName(input.name);
-		const profile = sanitizeSegment(input.profile ?? requestedName, "default");
-		const userDataDir = join(this.config.profileRoot, browserKey, profile);
+		// The session label is a display name, not an identity. Deriving the profile from it used to
+		// be harmless because profiles were project-local; now that they are shared across projects,
+		// auto-generated labels like "Browser-1" would collide between unrelated repositories. Ask
+		// for a profile explicitly when a separate one is wanted.
+		const profile = sanitizeSegment(input.profile, "default");
+		const userDataDir = join(this.config.profileRoot, sanitizeSegment(browserKey, "browser"), profile);
+		assertInsideRoot(this.config.profileRoot, userDataDir);
 		await mkdir(userDataDir, { recursive: true });
 
 		return this.withLaunchSessionLock(browserKey, profile, async () => {
@@ -221,10 +240,13 @@ export class BrowserManager {
 				return this.reuseLaunchSession(existingSession, input, userDataDir);
 			}
 
-			const { browser, dispose } = await getAdapter(definition.engine).launch(definition, {
+			const { browser, dispose, adopted, ownerCwd } = await getAdapter(definition.engine).launch(definition, {
 				executablePath,
 				headless: input.headless ?? this.config.defaults.headless,
 				userDataDir,
+				browserKey,
+				profile,
+				cwd: this.cwd,
 			});
 
 			const session = await this.registerSession({
@@ -236,6 +258,7 @@ export class BrowserManager {
 				mode: "launch",
 				profile,
 				dispose,
+				adopted,
 			});
 
 			const tabs = await this.syncPages(session);
@@ -248,13 +271,20 @@ export class BrowserManager {
 				this.recordWorkflowStep(session.id, session.currentPageId, { type: "navigate", url: currentPage.url(), timestamp: Date.now() });
 			}
 
+			const opened = input.url ? ` and opened ${input.url}` : "";
 			return {
-				text: `Started ${session.name} (${definition.displayName}, ${session.id})${input.url ? ` and opened ${input.url}` : ""}.`,
+				text: adopted
+					? `Adopted the ${definition.displayName} window already open on shared profile '${profile}'` +
+						`${ownerCwd && ownerCwd !== this.cwd ? ` (started by Pi in ${ownerCwd})` : ""} as ${session.id}${opened}.` +
+						" It stays open when this session ends. Pass a different `profile` for a separate window."
+					: `Started ${session.name} (${definition.displayName}, ${session.id})${opened}.`,
 				details: {
 					action: "start",
 					session: await this.summarizeSession(session),
 					tabs,
 					profilePath: userDataDir,
+					adopted,
+					ownerCwd: ownerCwd ?? null,
 				},
 			};
 		});
@@ -660,7 +690,7 @@ export class BrowserManager {
 		const outputPath = input.path
 			? resolve(this.cwd, input.path)
 			: join(this.config.artifactRoot, "screenshots", `${session.id}-${Date.now()}.png`);
-		await mkdir(dirname(outputPath), { recursive: true });
+		ensureStorageDir(this.cwd, dirname(outputPath));
 		await page.screenshot({
 			path: outputPath,
 			fullPage: input.fullPage ?? true,
@@ -688,7 +718,7 @@ export class BrowserManager {
 		const outputPath = input.path
 			? resolve(this.cwd, input.path)
 			: join(this.config.artifactRoot, "recordings", `${session.id}-${sanitizeSegment(tabId, "tab")}-${Date.now()}.${format}`);
-		await mkdir(dirname(outputPath), { recursive: true });
+		ensureStorageDir(this.cwd, dirname(outputPath));
 
 		const ffmpegPath = input.ffmpegPath ?? bundledFfmpegPath ?? "ffmpeg";
 		const ffmpeg = spawn(ffmpegPath, this.ffmpegArgs(format, fps, outputPath), {
@@ -815,7 +845,7 @@ export class BrowserManager {
 		};
 
 		this.workflowRecordings.set(recording.id, recording);
-		await mkdir(this.workflowRoot(), { recursive: true });
+		ensureStorageDir(this.cwd, this.workflowRoot());
 		await page.removeExposedFunction(WORKFLOW_RECORDER_FUNCTION).catch(() => undefined);
 		await page.exposeFunction(WORKFLOW_RECORDER_FUNCTION, (payload: Record<string, unknown>) => {
 			this.recordWorkflowBrowserEvent(recording.id, payload);
@@ -999,7 +1029,7 @@ export class BrowserManager {
 		const outputPath = input.path
 			? resolve(this.cwd, input.path)
 			: resolve(this.workflowRoot(), defaultFileName);
-		await mkdir(dirname(outputPath), { recursive: true });
+		ensureStorageDir(this.cwd, dirname(outputPath));
 		await writeFile(outputPath, script, "utf8");
 		const fileUrl = pathToFileURL(outputPath).href;
 		return {
@@ -1267,6 +1297,7 @@ export class BrowserManager {
 		mode: "launch" | "attach";
 		profile?: string;
 		dispose?: () => Promise<void>;
+		adopted?: boolean;
 	}): Promise<BrowserSessionRecord> {
 		const createdAt = Date.now();
 		const session: BrowserSessionRecord = {
@@ -1277,6 +1308,7 @@ export class BrowserManager {
 			engine: input.engine,
 			mode: input.mode,
 			profile: input.profile,
+			adopted: input.adopted,
 			browser: input.browser,
 			pages: new Map<string, Page>(),
 			currentPageId: undefined,
@@ -1397,6 +1429,7 @@ export class BrowserManager {
 			engine: session.engine,
 			mode: session.mode,
 			profile: session.profile,
+			adopted: session.adopted,
 			current: session.id === this.currentSessionId,
 			currentTabId: session.currentPageId,
 			tabCount: session.pages.size,

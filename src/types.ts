@@ -70,12 +70,33 @@ export interface ExtensionDefaults {
 	navigationWaitUntil: NavigationWaitUntil;
 }
 
+export type ProfileScope = "global" | "project";
+
 export interface RawExtensionConfig {
 	defaultBrowser?: string;
+	/**
+	 * Where named browser profiles live. "global" (the default) shares them across projects under the
+	 * Pi agent directory; "project" keeps them in `<cwd>/.pi/.pi-puppeteer/profiles`. An explicit
+	 * `profileRoot` overrides this.
+	 */
+	profileScope?: ProfileScope;
 	profileRoot?: string;
 	artifactRoot?: string;
 	defaults?: Partial<ExtensionDefaults>;
 	browsers?: Record<string, RawBrowserDefinition>;
+}
+
+/** One profile directory the migration relocated, or could not relocate yet. */
+export interface ProfileMigrationEntry {
+	source: string;
+	target: string;
+	reason?: "target-exists" | "locked" | "failed";
+}
+
+/** Result of relocating legacy project-local profiles to the global profile root. */
+export interface ProfileMigrationReport {
+	moved: ProfileMigrationEntry[];
+	pending: ProfileMigrationEntry[];
 }
 
 export interface ResolvedConfig {
@@ -85,6 +106,8 @@ export interface ResolvedConfig {
 	defaultBrowserSetting: string;
 	/** Detected OS default browser key, or the built-in fallback when detection is unsupported. */
 	systemDefaultBrowser: string;
+	/** Resolved profile scope after config precedence. */
+	profileScope: ProfileScope;
 	profileRoot: string;
 	artifactRoot: string;
 	defaults: ExtensionDefaults;
@@ -93,6 +116,8 @@ export interface ResolvedConfig {
 		global: string;
 		project: string;
 	};
+	/** Populated only on the first `loadConfig` of a session that actually relocated profiles. */
+	profileMigration?: ProfileMigrationReport;
 }
 
 export interface BrowserToolInput {
@@ -149,6 +174,8 @@ export interface SessionSummary {
 	engine: BrowserEngine;
 	mode: SessionMode;
 	profile?: string;
+	/** True when this session connected to a browser another process already had open on the profile. */
+	adopted?: boolean;
 	current: boolean;
 	currentTabId?: string;
 	tabCount: number;
@@ -167,6 +194,7 @@ export interface BrowserSessionRecord {
 	engine: BrowserEngine;
 	mode: SessionMode;
 	profile?: string;
+	adopted?: boolean;
 	browser: Browser;
 	pages: Map<string, Page>;
 	currentPageId?: string;

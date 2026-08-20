@@ -90,7 +90,7 @@ A typical project config looks like this:
 ```json
 {
   "defaultBrowser": "system",
-  "profileRoot": ".pi/.pi-puppeteer/profiles",
+  "profileScope": "global",
   "artifactRoot": ".pi/.pi-puppeteer/artifacts",
   "defaults": {
     "headless": false,
@@ -110,6 +110,18 @@ A typical project config looks like this:
 
 Use `defaultBrowser: "system"` to follow your OS default browser, or set it to a configured browser key such as `chrome`, `edge`, `brave`, or a custom entry like `edge-work`.
 
+### Where profiles are stored
+
+`profileScope` controls where named browser profiles live:
+
+| Value | Location |
+| --- | --- |
+| `"global"` (default) | `~/.pi/agent/extensions/pi-puppeteer/profiles/<browser>/<profile>`, shared across all your projects |
+| `"project"` | `<cwd>/.pi/.pi-puppeteer/profiles/<browser>/<profile>` |
+
+Set `profileRoot` to override the location outright. It accepts an absolute path or a `~/`-prefixed
+one, and takes precedence over `profileScope`.
+
 ## Screenshots and recordings
 
 Screenshots and recordings are saved under the project artifact directory by default:
@@ -117,6 +129,9 @@ Screenshots and recordings are saved under the project artifact directory by def
 ```text
 .pi/.pi-puppeteer/artifacts/
 ```
+
+That directory carries its own `.gitignore`. Pass an explicit `path` to write a file your repository
+can see.
 
 Viewport recordings are captured through `ffmpeg`. The package uses the bundled `ffmpeg-static` binary when available. You can also install `ffmpeg` on your `PATH` or pass a custom `ffmpegPath`.
 
@@ -146,24 +161,37 @@ Saved workflow files live under:
 .pi/.pi-puppeteer/workflows/
 ```
 
+Workflows stay project-local: a recorded login or setup flow belongs to the app it was recorded
+against.
+
 Workflow recording captures page-level events such as navigation, clicks, form changes, key presses, submits, and scrolls. Password inputs are saved as `<redacted>`.
 
 ## Runtime storage
 
-By default, project-specific runtime files live under:
+Storage is split in two, according to what the data is.
 
-```text
-.pi/.pi-puppeteer/
-```
-
-This includes:
+**Project storage** — `<cwd>/.pi/.pi-puppeteer/`
 
 - `settings.json` — project configuration
-- `profiles/` — persistent browser profiles
 - `artifacts/` — screenshots and recordings
 - `workflows/` — saved workflow recordings and exports
+- `.gitignore` — written automatically, so none of the above can be staged by accident
 
-These files are local runtime state and are normally ignored by git.
+This directory is created lazily. Starting Pi in a project does not create it; only writing a
+screenshot, recording, workflow, or setting does.
+
+**Global storage** — `~/.pi/agent/extensions/pi-puppeteer/`
+
+- `profiles/<browser>/<profile>` — persistent browser profiles
+
+Profiles live outside your repositories for two reasons. A browser profile holds cookies and session
+tokens, and a single Chromium profile routinely runs to hundreds of megabytes across thousands of
+cache files — neither belongs in a project directory. Because profiles are keyed by name rather than
+by project, signing in to a site once makes that session available to every project using the same
+profile name.
+
+To save a screenshot or recording somewhere git can see it, pass an explicit `path`; it is resolved
+against the project directory rather than the artifact root.
 
 ## Notes
 
@@ -171,6 +199,27 @@ These files are local runtime state and are normally ignored by git.
 - Attach mode requires the target Chromium browser to be running with remote debugging enabled.
 - Attached browsers are disconnected, not forcibly closed, when Pi shuts down.
 - Launch-created browser sessions are closed when Pi shuts down.
+- Only one browser can run per profile. Starting a session on a profile another Pi session already
+  has open adopts that browser instead of launching a second one; an adopted browser stays open when
+  the adopting session ends. Pass a different `profile` when you want a separate window.
+
+## Upgrading from 0.2.x
+
+Browser profiles move out of your projects on the first run. Each `<cwd>/.pi/.pi-puppeteer/profiles`
+directory is relocated to the shared global root, and Pi reports what it moved.
+
+- Profiles are never merged. If a profile of the same name already exists globally — likely, since
+  the old default derived the profile name from the session label — the project copy is left exactly
+  where it is and reported. Start a session with a different `profile` name to keep using it, or
+  delete the directory once you no longer need it.
+- A profile a browser still has open is deferred. Close the browser and restart Pi to finish.
+- Set `"profileScope": "project"` to keep profiles project-local.
+- A `profileRoot` of `.pi/.pi-puppeteer/profiles` is treated as the old default and upgraded. Any
+  other value is left alone.
+
+If browser profile data was ever committed, remove it from the index with
+`git rm -r --cached .pi/.pi-puppeteer` and rotate any credentials for sites you were signed into on
+a repository that has a public remote.
 
 ## Links
 

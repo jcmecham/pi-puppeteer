@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { loadConfig } from "../src/config.ts";
+import { ensureStorageDir, loadConfig } from "../src/config.ts";
 import type { RawExtensionConfig } from "../src/types.ts";
 
 // Interactive (or scripted) picker for the default browser. Lists every browser the
@@ -55,7 +55,7 @@ async function writeDefault(key: string): Promise<void> {
 		? (JSON.parse(readFileSync(projectConfigPath, "utf8")) as RawExtensionConfig)
 		: {};
 	existing.defaultBrowser = key;
-	await mkdir(dirname(projectConfigPath), { recursive: true });
+	ensureStorageDir(cwd, dirname(projectConfigPath));
 	await writeFile(projectConfigPath, `${JSON.stringify(existing, null, 2)}\n`, "utf8");
 }
 

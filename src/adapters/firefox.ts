@@ -16,7 +16,7 @@ export class FirefoxAdapter implements BrowserAdapter {
 			defaultViewport: null,
 			args: definition.launchArgs,
 		});
-		return { browser, dispose: () => browser.close() };
+		return { browser, dispose: () => browser.close(), adopted: false };
 	}
 
 	async attach(_definition: BrowserDefinition, _endpoint: string): Promise<Browser> {

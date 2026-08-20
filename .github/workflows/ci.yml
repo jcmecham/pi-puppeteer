@@ -8,7 +8,13 @@ on:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    # The storage migration turns on the difference between EXDEV and EPERM/EBUSY, and file locking
+    # behaves differently on Windows, so both platforms run the checks.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
