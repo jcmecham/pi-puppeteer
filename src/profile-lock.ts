@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
@@ -126,6 +126,69 @@ export async function inspectProfile(userDataDir: string): Promise<ProfileState>
 	if (browserURL && (await probeEndpoint(browserURL))) return { state: "live", browserURL };
 
 	return { state: "free" };
+}
+
+export interface DiscoveredProfile {
+	browserKey: string;
+	profile: string;
+	path: string;
+	state: ProfileState["state"];
+	/** Set when a browser is live or starting on this profile. */
+	owner?: ProfileOwner;
+	browserURL?: string;
+	lastUsedAt?: number;
+}
+
+function directoryNames(root: string): string[] {
+	try {
+		return readdirSync(root, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name);
+	} catch {
+		return [];
+	}
+}
+
+function lastUsedAt(path: string): number | undefined {
+	try {
+		return statSync(path).mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * List every profile under a profile root along with whether a browser is currently running on it.
+ *
+ * Profiles are shared across projects, so "is this one in use?" can only be answered by looking at
+ * the profile itself. Probes run concurrently: each one may wait on a network timeout, and a root
+ * can hold a dozen profiles.
+ */
+export async function discoverProfiles(profileRoot: string, browserKey?: string): Promise<DiscoveredProfile[]> {
+	const browserKeys = browserKey ? [browserKey] : directoryNames(profileRoot);
+
+	const candidates = browserKeys.flatMap((key) =>
+		directoryNames(join(profileRoot, key)).map((profile) => ({ browserKey: key, profile, path: join(profileRoot, key, profile) })),
+	);
+
+	const discovered = await Promise.all(
+		candidates.map(async (candidate): Promise<DiscoveredProfile> => {
+			const state = await inspectProfile(candidate.path);
+			return {
+				...candidate,
+				state: state.state,
+				owner: state.state === "free" ? undefined : state.owner,
+				browserURL: state.state === "live" ? state.browserURL : undefined,
+				lastUsedAt: lastUsedAt(candidate.path),
+			};
+		}),
+	);
+
+	// Running profiles first, then most recently used, so the interesting entries lead.
+	return discovered.sort((left, right) => {
+		const liveDelta = Number(right.state !== "free") - Number(left.state !== "free");
+		return liveDelta !== 0 ? liveDelta : (right.lastUsedAt ?? 0) - (left.lastUsedAt ?? 0);
+	});
 }
 
 /** Wait out another process's in-flight launch rather than racing it into a forwarded no-op. */

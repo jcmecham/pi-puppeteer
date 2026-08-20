@@ -89,6 +89,76 @@ async function chooseDefaultBrowser(
 	return options.find((option) => option.label === choice)?.key;
 }
 
+interface ProfileListEntry {
+	browserKey: string;
+	displayName: string;
+	profile: string;
+	inUse: boolean;
+	state: "free" | "starting" | "live";
+	sessionId: string | null;
+	ownerCwd: string | null;
+	lastUsedAt: number | null;
+}
+
+const NEW_PROFILE_LABEL = "New profile…";
+
+function profileOptionLabel(entry: ProfileListEntry, cwd: string): string {
+	if (entry.sessionId) return `${entry.profile}  ● in use by ${entry.sessionId} in this session`;
+	if (entry.state === "starting") return `${entry.profile}  ● starting`;
+	if (!entry.inUse) return `${entry.profile}  ○ free`;
+	if (!entry.ownerCwd) return `${entry.profile}  ● running outside Pi`;
+	return `${entry.profile}  ● running — Pi in ${entry.ownerCwd === cwd ? "this project" : entry.ownerCwd}`;
+}
+
+/**
+ * Ask which profile to open, showing which ones already have a browser running.
+ *
+ * Profiles are shared across projects, so launching blind means finding out about a collision only
+ * after the fact. Picking a running profile is allowed and connects to that browser; the label says
+ * so, and the start response repeats it.
+ *
+ * Returns the chosen profile name, or undefined when the user cancels.
+ */
+async function chooseProfile(
+	ctx: ExtensionCommandContext | ExtensionContext,
+	manager: BrowserManager,
+	browserKey: string,
+): Promise<string | undefined> {
+	let entries: ProfileListEntry[] = [];
+	try {
+		const listed = await manager.execute({ action: "list_profiles", browserKey });
+		entries = (listed.details.profiles as ProfileListEntry[] | undefined) ?? [];
+	} catch {
+		// Discovery is a convenience. If the profile root cannot be read, fall through to naming one.
+	}
+
+	if (!entries.length) return promptForProfileName(ctx, "default");
+
+	const options = [...entries.map((entry) => profileOptionLabel(entry, ctx.cwd)), NEW_PROFILE_LABEL];
+	const choice = await ctx.ui.select("Select a profile:", options);
+	if (!choice) return undefined;
+	if (choice === NEW_PROFILE_LABEL) return promptForProfileName(ctx, suggestProfileName(entries));
+
+	return entries[options.indexOf(choice)]?.profile;
+}
+
+/** Suggest a name no existing profile is using, so "New profile…" lands somewhere free. */
+function suggestProfileName(entries: ProfileListEntry[]): string {
+	const taken = new Set(entries.map((entry) => entry.profile.toLowerCase()));
+	if (!taken.has("default")) return "default";
+	let suffix = 2;
+	while (taken.has(`default-${suffix}`)) suffix += 1;
+	return `default-${suffix}`;
+}
+
+async function promptForProfileName(
+	ctx: ExtensionCommandContext | ExtensionContext,
+	suggestion: string,
+): Promise<string | undefined> {
+	const entered = await ctx.ui.input("Profile name:", suggestion);
+	return entered?.trim() || undefined;
+}
+
 interface WorkflowStatusUiContext {
 	ui: {
 		theme: { fg: (...args: any[]) => string };
@@ -905,15 +975,16 @@ async function openBrowserSessionsManager(
 				const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
 				ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
 			} else if (action.type === "create") {
+				const chosenProfile = await chooseProfile(ctx, browserManager, config.defaultBrowser);
+				if (!chosenProfile) continue;
+
 				const existingNames = new Set(sessions.map((session) => session.name.toLowerCase()));
 				let suggestedNumber = 1;
 				while (existingNames.has(`browser-${suggestedNumber}`)) suggestedNumber += 1;
-				// The first window in a project uses the shared "default" profile; extra windows get
-				// their own, since one browser process can only hold one user-data-dir open.
 				const started = await browserManager.execute({
 					action: "start",
 					name: `Browser-${suggestedNumber}`,
-					profile: suggestedNumber === 1 ? undefined : `browser-${suggestedNumber}`,
+					profile: chosenProfile,
 				});
 				const session = started.details.session as SessionSummary | undefined;
 				selectedSessionId = session?.id;
@@ -1016,6 +1087,7 @@ const BrowserToolSchema = Type.Object({
 	action: StringEnum(
 		[
 			"list_browsers",
+			"list_profiles",
 			"start",
 			"attach",
 			"sessions",
@@ -1053,7 +1125,12 @@ const BrowserToolSchema = Type.Object({
 	sessionId: Type.Optional(Type.String({ description: "Browser session ID, like session-1" })),
 	tabId: Type.Optional(Type.String({ description: "Tab ID, like tab-1" })),
 	name: Type.Optional(Type.String({ description: "Friendly browser name shown in the browser manager" })),
-	profile: Type.Optional(Type.String({ description: "Named profile for launch mode" })),
+	profile: Type.Optional(
+		Type.String({
+			description:
+				"Named profile for launch mode. Profiles are shared across projects, so use list_profiles first to see which are already running.",
+		}),
+	),
 	url: Type.Optional(Type.String({ description: "URL for start, new_tab, or navigate" })),
 	selector: Type.Optional(Type.String({ description: "CSS selector for page actions" })),
 	text: Type.Optional(Type.String({ description: "Text content for type actions" })),
@@ -1222,6 +1299,7 @@ export default function (pi: ExtensionAPI) {
 			"Use browser start or browser attach before page actions when no browser session is open.",
 			"Use browser inspect or browser extract_text instead of dumping large page HTML into context.",
 			"Use workflow_list, workflow_replay, and workflow_details for saved workflow execution; use browser workflow_record_start/workflow_record_stop to record new workflows.",
+			"Profiles are shared across projects. Use browser list_profiles before starting a session on a named profile: starting on one that is already running connects to that browser instead of opening a new window.",
 		],
 		parameters: BrowserToolSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

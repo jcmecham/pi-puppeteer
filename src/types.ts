@@ -9,6 +9,7 @@ export type ScriptFormat = "puppeteer" | "browser_tool";
 
 export type BrowserAction =
 	| "list_browsers"
+	| "list_profiles"
 	| "start"
 	| "attach"
 	| "sessions"

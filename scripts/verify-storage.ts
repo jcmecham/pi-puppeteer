@@ -140,6 +140,40 @@ console.log("\nconfiguration");
 	check("a custom profileRoot skips migration", config.profileMigration === undefined);
 }
 
+console.log("\nprofile discovery");
+
+const { discoverProfiles } = await import("../src/profile-lock.ts");
+
+{
+	const root = join(ROOT, "discovery");
+	mkdirSync(join(root, "edge", "work"), { recursive: true });
+	mkdirSync(join(root, "edge", "scratch"), { recursive: true });
+	mkdirSync(join(root, "chrome", "default"), { recursive: true });
+
+	const all = await discoverProfiles(root);
+	check("every profile is found across browsers", all.length === 3, JSON.stringify(all.map((entry) => `${entry.browserKey}/${entry.profile}`)));
+	check("profiles with no browser read as free", all.every((entry) => entry.state === "free"));
+
+	const scoped = await discoverProfiles(root, "edge");
+	check("discovery can be scoped to one browser", scoped.length === 2 && scoped.every((entry) => entry.browserKey === "edge"));
+
+	// A dead owner must not make a profile look busy forever. Pid 1 is never this process, and the
+	// record is rejected outright on a hostname mismatch.
+	writeFileSync(
+		join(root, "edge", "work", ".pi-puppeteer-owner.json"),
+		JSON.stringify({ pid: 1, browserURL: "http://127.0.0.1:1", browserKey: "edge", profile: "work", cwd: root, startedAt: 0, host: "not-this-host", state: "ready" }),
+		"utf8",
+	);
+	const stale = await discoverProfiles(root, "edge");
+	check("a stale ownership record does not mark a profile busy", stale.every((entry) => entry.state === "free"), JSON.stringify(stale));
+	check("the stale record is cleaned up", !existsSync(join(root, "edge", "work", ".pi-puppeteer-owner.json")));
+
+	// An unreachable DevTools port is not evidence of a live browser either.
+	writeFileSync(join(root, "edge", "scratch", "DevToolsActivePort"), "1\n/devtools/browser/x", "utf8");
+	const deadPort = await discoverProfiles(root, "edge");
+	check("an unreachable DevTools port reads as free", deadPort.every((entry) => entry.state === "free"), JSON.stringify(deadPort));
+}
+
 rmSync(ROOT, { recursive: true, force: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

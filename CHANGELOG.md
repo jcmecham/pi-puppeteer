@@ -24,7 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   verbatim.
 - **Breaking:** the profile for a new session is no longer derived from the session name; it defaults
   to `default`. Pass `profile` explicitly for a separate browser window. Session labels are
-  auto-generated, so deriving from them would have made unrelated projects collide by default.
+  auto-generated, so deriving from them would have made unrelated projects collide by default. The
+  Browser Manager prompts for the profile instead of choosing one for you.
 - Starting a session on a profile another Pi session already has open now adopts that browser instead
   of launching a second one, and leaves it running when the adopting session ends.
 - `<cwd>/.pi/.pi-puppeteer/` is created lazily on first write instead of on every Pi session start.
@@ -32,6 +33,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `list_profiles` browser action, reporting every profile in the shared root, whether a browser is
+  currently running on it, and which project started it.
+- The Browser Manager now asks which profile to open, showing each one's state, instead of launching
+  blind and discovering a collision afterwards. Picking a running profile connects to that browser.
 - `profileScope` config key (`"global"` or `"project"`, default `"global"`).
 - `<cwd>/.pi/.pi-puppeteer/.gitignore` is written whenever the storage directory exists, so runtime
   state cannot be staged by accident.

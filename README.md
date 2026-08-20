@@ -122,6 +122,16 @@ Use `defaultBrowser: "system"` to follow your OS default browser, or set it to a
 Set `profileRoot` to override the location outright. It accepts an absolute path or a `~/`-prefixed
 one, and takes precedence over `profileScope`.
 
+Because profiles are shared, one may already have a browser running on it — possibly started by Pi in
+a different project. Ask before you launch:
+
+- “List my browser profiles.” (`list_profiles`) reports every profile and whether it is in use, and
+  names the project that started it.
+- Creating a session from the Browser Manager shows the same list and lets you pick.
+
+Only one browser can run per profile, so starting a session on a profile that is already running
+connects you to that browser rather than opening a second window.
+
 ## Screenshots and recordings
 
 Screenshots and recordings are saved under the project artifact directory by default:
@@ -202,6 +212,9 @@ against the project directory rather than the artifact root.
 - Only one browser can run per profile. Starting a session on a profile another Pi session already
   has open adopts that browser instead of launching a second one; an adopted browser stays open when
   the adopting session ends. Pass a different `profile` when you want a separate window.
+- A browser running on a profile is only detectable if it exposes a debugging endpoint, which is the
+  case for anything Pi launched. A browser you started yourself, outside Pi, on the same profile will
+  not be reported as in use.
 
 ## Upgrading from 0.2.x
 

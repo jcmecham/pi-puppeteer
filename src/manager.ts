@@ -7,6 +7,7 @@ import type { Browser, Page } from "puppeteer-core";
 import { KnownDevices } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
 import { ensureStorageDir } from "./config.ts";
+import { discoverProfiles } from "./profile-lock.ts";
 import {
 	createWorkflowId,
 	deleteWorkflow,
@@ -112,6 +113,8 @@ export class BrowserManager {
 		switch (input.action) {
 			case "list_browsers":
 				return this.listBrowsers();
+			case "list_profiles":
+				return this.listProfiles(input);
 			case "start":
 				return this.start(input);
 			case "attach":
@@ -207,6 +210,58 @@ export class BrowserManager {
 				configPaths: this.config.configPaths,
 				browsers,
 			},
+		};
+	}
+
+	/**
+	 * Report every profile in the shared root and whether a browser is currently running on it.
+	 *
+	 * Profiles are shared across projects, so a profile can be busy because of a Pi session in a
+	 * different directory. Checking up front beats discovering it at launch.
+	 */
+	private async listProfiles(input: BrowserToolInput): Promise<ToolResponse> {
+		const browserKey = input.browserKey ? this.resolveBrowserKey(input.browserKey) : undefined;
+		const discovered = await discoverProfiles(this.config.profileRoot, browserKey);
+		const openHere = new Map(
+			[...this.sessions.values()]
+				.filter((session) => session.mode === "launch" && session.profile)
+				.map((session) => [`${session.browserKey}/${session.profile}`, session.id]),
+		);
+
+		const profiles = discovered.map((entry) => {
+			const sessionId = openHere.get(`${entry.browserKey}/${entry.profile}`);
+			return {
+				browserKey: entry.browserKey,
+				displayName: this.config.browsers[entry.browserKey]?.displayName ?? entry.browserKey,
+				profile: entry.profile,
+				path: entry.path,
+				inUse: entry.state !== "free",
+				state: entry.state,
+				sessionId: sessionId ?? null,
+				ownerCwd: entry.owner?.cwd ?? null,
+				// A profile is "ours" when this Pi process launched it, whatever the project.
+				ownedByThisSession: sessionId !== undefined,
+				lastUsedAt: entry.lastUsedAt ?? null,
+			};
+		});
+
+		const lines = profiles.map((entry) => {
+			const where = entry.sessionId
+				? `in use by ${entry.sessionId} in this session`
+				: entry.state === "starting"
+					? "starting"
+					: entry.inUse
+						? `running${entry.ownerCwd ? ` (started by Pi in ${entry.ownerCwd})` : " outside this session"}`
+						: "free";
+			return `${entry.browserKey}/${entry.profile} — ${where}`;
+		});
+
+		const busy = profiles.filter((entry) => entry.inUse).length;
+		return {
+			text: profiles.length
+				? `Profiles under ${this.config.profileRoot} (${busy} in use, ${profiles.length - busy} free):\n${lines.join("\n")}`
+				: `No profiles exist yet under ${this.config.profileRoot}.`,
+			details: { action: "list_profiles", profileRoot: this.config.profileRoot, profiles },
 		};
 	}
 

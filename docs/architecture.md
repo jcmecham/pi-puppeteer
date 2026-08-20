@@ -199,6 +199,14 @@ pid, host, state, DevTools URL).
 - Process reaping sweeps by user data dir **only** while this process owns the profile, and matches
   the whole `--user-data-dir` argument — a prefix match would let `.../default` reap `.../default-2`.
 
+Ownership is also readable ahead of time. `discoverProfiles` walks the profile root and resolves each
+entry to free, starting, or live, probing candidates concurrently because each probe can wait on a
+network timeout. It backs the `list_profiles` action and the Browser Manager’s profile picker, so a
+contended profile is a visible choice rather than a surprise at launch.
+
+Detection sees only browsers exposing a debugging endpoint. That covers everything Pi launches; a
+browser the user started themselves on the same profile is invisible to it and will collide at launch.
+
 ## 5. Session model
 
 A session ID maps to one connected browser instance.
