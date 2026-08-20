@@ -37,6 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   currently running on it, and which project started it.
 - The Browser Manager now asks which profile to open, showing each one's state, instead of launching
   blind and discovering a collision afterwards. Picking a running profile connects to that browser.
+- `rename_profile` and `delete_profile` actions, with rename and delete also available from the
+  profile picker. Both refuse while a browser is running on the profile, including one started by Pi
+  in another project.
 - `profileScope` config key (`"global"` or `"project"`, default `"global"`).
 - `<cwd>/.pi/.pi-puppeteer/.gitignore` is written whenever the storage directory exists, so runtime
   state cannot be staged by accident.

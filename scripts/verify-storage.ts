@@ -174,6 +174,66 @@ const { discoverProfiles } = await import("../src/profile-lock.ts");
 	check("an unreachable DevTools port reads as free", deadPort.every((entry) => entry.state === "free"), JSON.stringify(deadPort));
 }
 
+console.log("\nprofile management");
+
+{
+	const { BrowserManager } = await import("../src/manager.ts");
+	const cwd = project("manage");
+	const config = loadConfig(cwd);
+	const manager = new BrowserManager(cwd, config);
+
+	// Any discovered browser works; these actions never launch one.
+	const browserKey = Object.keys(config.browsers)[0]!;
+	const profileDir = (name: string) => join(GLOBAL_PROFILES, browserKey, name);
+	mkdirSync(profileDir("idle"), { recursive: true });
+	writeFileSync(join(profileDir("idle"), "marker"), "KEEP", "utf8");
+	mkdirSync(profileDir("taken"), { recursive: true });
+
+	async function failsWith(name: string, run: () => Promise<unknown>, needle: string): Promise<void> {
+		try {
+			await run();
+			check(name, false, "no error was thrown");
+		} catch (error) {
+			const message = (error as Error).message;
+			check(name, message.includes(needle), message);
+		}
+	}
+
+	await manager.execute({ action: "rename_profile", browserKey, profile: "idle", targetProfile: "renamed" });
+	check("rename moves the profile directory", existsSync(join(profileDir("renamed"), "marker")) && !existsSync(profileDir("idle")));
+
+	await failsWith(
+		"rename refuses an existing target",
+		() => manager.execute({ action: "rename_profile", browserKey, profile: "renamed", targetProfile: "taken" }),
+		"already exists",
+	);
+	await failsWith(
+		"rename refuses an unknown profile",
+		() => manager.execute({ action: "rename_profile", browserKey, profile: "nope", targetProfile: "x" }),
+		"No profile",
+	);
+	await failsWith(
+		"rename refuses a blank new name",
+		() => manager.execute({ action: "rename_profile", browserKey, profile: "renamed", targetProfile: "   " }),
+		"new profile name is required",
+	);
+
+	// A traversal attempt is sanitized into a safe name rather than rejected; the containment assert
+	// in the manager is the backstop.
+	await manager.execute({ action: "rename_profile", browserKey, profile: "renamed", targetProfile: "../escaped" });
+	check("rename sanitizes a traversal into the profile root", existsSync(profileDir("escaped")));
+	check("rename writes nothing outside the profile root", !existsSync(join(GLOBAL_PROFILES, "..", "escaped")));
+
+	const deleted = await manager.execute({ action: "delete_profile", browserKey, profile: "taken" });
+	check("delete removes the profile directory", !existsSync(profileDir("taken")));
+	check("delete warns that signed-in sessions are lost", deleted.text.includes("signing in"), deleted.text);
+	await failsWith(
+		"delete refuses an unknown profile",
+		() => manager.execute({ action: "delete_profile", browserKey, profile: "gone" }),
+		"No profile",
+	);
+}
+
 rmSync(ROOT, { recursive: true, force: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

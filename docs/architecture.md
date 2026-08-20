@@ -204,6 +204,10 @@ entry to free, starting, or live, probing candidates concurrently because each p
 network timeout. It backs the `list_profiles` action and the Browser Manager’s profile picker, so a
 contended profile is a visible choice rather than a surprise at launch.
 
+Renaming and deleting a profile go through the same liveness check. Both refuse while a browser holds
+the profile — whether that is a session in this process or a Pi session in another project — because
+moving or removing a live user data dir corrupts it.
+
 Detection sees only browsers exposing a debugging endpoint. That covers everything Pi launches; a
 browser the user started themselves on the same profile is invisible to it and will collide at launch.
 

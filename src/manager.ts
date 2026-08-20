@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,7 +8,7 @@ import type { Browser, Page } from "puppeteer-core";
 import { KnownDevices } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
 import { ensureStorageDir } from "./config.ts";
-import { discoverProfiles } from "./profile-lock.ts";
+import { discoverProfiles, inspectProfile } from "./profile-lock.ts";
 import {
 	createWorkflowId,
 	deleteWorkflow,
@@ -115,6 +116,10 @@ export class BrowserManager {
 				return this.listBrowsers();
 			case "list_profiles":
 				return this.listProfiles(input);
+			case "rename_profile":
+				return this.renameProfile(input);
+			case "delete_profile":
+				return this.deleteProfile(input);
 			case "start":
 				return this.start(input);
 			case "attach":
@@ -262,6 +267,69 @@ export class BrowserManager {
 				? `Profiles under ${this.config.profileRoot} (${busy} in use, ${profiles.length - busy} free):\n${lines.join("\n")}`
 				: `No profiles exist yet under ${this.config.profileRoot}.`,
 			details: { action: "list_profiles", profileRoot: this.config.profileRoot, profiles },
+		};
+	}
+
+	/**
+	 * Resolve a profile directory for a management action, refusing anything currently running.
+	 *
+	 * Renaming or deleting a profile out from under a live browser corrupts it, and the browser may
+	 * belong to a Pi session in a different project.
+	 */
+	private async resolveIdleProfile(
+		input: BrowserToolInput,
+		verb: string,
+	): Promise<{ browserKey: string; profile: string; dir: string }> {
+		const browserKey = this.resolveBrowserKey(input.browserKey);
+		const profile = sanitizeSegment(input.profile, "");
+		if (!profile) throw new Error(`A profile name is required to ${verb} a profile.`);
+
+		const dir = join(this.config.profileRoot, sanitizeSegment(browserKey, "browser"), profile);
+		assertInsideRoot(this.config.profileRoot, dir);
+		if (!existsSync(dir)) throw new Error(`No profile '${profile}' exists for ${browserKey}.`);
+
+		const openHere = [...this.sessions.values()].find(
+			(session) => session.mode === "launch" && session.browserKey === browserKey && session.profile === profile,
+		);
+		if (openHere) {
+			throw new Error(`Cannot ${verb} profile '${profile}': it is open as ${openHere.id}. Close that session first.`);
+		}
+
+		const state = await inspectProfile(dir);
+		if (state.state !== "free") {
+			const owner = state.state === "live" ? state.owner : state.owner;
+			const where = owner?.cwd ? ` by Pi in ${owner.cwd}` : "";
+			throw new Error(`Cannot ${verb} profile '${profile}': a browser is running on it${where}. Close it first.`);
+		}
+
+		return { browserKey, profile, dir };
+	}
+
+	private async renameProfile(input: BrowserToolInput): Promise<ToolResponse> {
+		const { browserKey, profile, dir } = await this.resolveIdleProfile(input, "rename");
+
+		const target = sanitizeSegment(input.targetProfile, "");
+		if (!target) throw new Error("A new profile name is required.");
+		if (target === profile) throw new Error(`Profile '${profile}' already has that name.`);
+
+		const targetDir = join(this.config.profileRoot, sanitizeSegment(browserKey, "browser"), target);
+		assertInsideRoot(this.config.profileRoot, targetDir);
+		if (existsSync(targetDir)) throw new Error(`A profile named '${target}' already exists for ${browserKey}.`);
+
+		await rename(dir, targetDir);
+		return {
+			text: `Renamed profile '${profile}' to '${target}' for ${browserKey}.`,
+			details: { action: "rename_profile", browserKey, profile: target, previousProfile: profile, path: targetDir },
+		};
+	}
+
+	private async deleteProfile(input: BrowserToolInput): Promise<ToolResponse> {
+		const { browserKey, profile, dir } = await this.resolveIdleProfile(input, "delete");
+
+		await rm(dir, { recursive: true, force: true });
+		return {
+			text: `Deleted profile '${profile}' for ${browserKey}. Any sites it was signed in to will need signing in to again.`,
+			details: { action: "delete_profile", browserKey, profile, path: dir },
 		};
 	}
 

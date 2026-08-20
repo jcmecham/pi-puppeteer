@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -100,46 +100,274 @@ interface ProfileListEntry {
 	lastUsedAt: number | null;
 }
 
-const NEW_PROFILE_LABEL = "New profile…";
+type ProfilePickerAction =
+	| { type: "cancel" }
+	| { type: "open"; profile: ProfileListEntry }
+	| { type: "new" }
+	| { type: "rename"; profile: ProfileListEntry };
 
-function profileOptionLabel(entry: ProfileListEntry, cwd: string): string {
-	if (entry.sessionId) return `${entry.profile}  ● in use by ${entry.sessionId} in this session`;
-	if (entry.state === "starting") return `${entry.profile}  ● starting`;
-	if (!entry.inUse) return `${entry.profile}  ○ free`;
-	if (!entry.ownerCwd) return `${entry.profile}  ● running outside Pi`;
-	return `${entry.profile}  ● running — Pi in ${entry.ownerCwd === cwd ? "this project" : entry.ownerCwd}`;
+/** Status text for a profile row, in the same voice the sessions table uses. */
+function profileStatusLabel(entry: ProfileListEntry, cwd: string): string {
+	if (entry.sessionId) return `in use by ${entry.sessionId}`;
+	if (entry.state === "starting") return "starting…";
+	if (!entry.inUse) return "free";
+	if (!entry.ownerCwd) return "running outside Pi";
+	return entry.ownerCwd === cwd ? "running in this project" : `running — Pi in ${basename(entry.ownerCwd)}`;
+}
+
+function profileStatusColor(entry: ProfileListEntry): "success" | "warning" | "muted" {
+	if (entry.state === "starting") return "warning";
+	return entry.inUse ? "success" : "muted";
+}
+
+/**
+ * Profile picker, rendered in the same frame as the Browser Manager.
+ *
+ * Deleting happens in place behind a confirm, the way closing a session does. Renaming needs a text
+ * prompt, which cannot run inside the custom screen, so it exits and the caller re-enters.
+ */
+async function showProfilePickerScreen(
+	ctx: ExtensionCommandContext | ExtensionContext,
+	browserLabel: string,
+	profiles: ProfileListEntry[],
+	onDeleteProfile: (profile: ProfileListEntry) => Promise<ProfileListEntry[]>,
+): Promise<ProfilePickerAction> {
+	let selectedIndex = 0;
+	let deleteArmed = false;
+	let deleteInProgress = false;
+	let requestRender: (() => void) | undefined;
+	let component: RecordingScreenComponent | undefined;
+
+	return ctx.ui.custom<ProfilePickerAction>((tui, theme, keybindings, done) => {
+		requestRender = () => tui.requestRender();
+		const deleteSelectedProfile = async (profile: ProfileListEntry) => {
+			if (deleteInProgress) return;
+			deleteInProgress = true;
+			requestRender?.();
+			try {
+				profiles = await onDeleteProfile(profile);
+				selectedIndex = profiles.length ? Math.min(selectedIndex, profiles.length - 1) : 0;
+			} catch (error) {
+				ctx.ui.notify((error as Error).message, "error");
+			} finally {
+				deleteArmed = false;
+				deleteInProgress = false;
+				requestRender?.();
+			}
+		};
+		component = {
+			render(width: number): string[] {
+				const minWidth = Math.max(24, width);
+				const innerWidth = Math.max(1, minWidth - 4);
+				const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
+				const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
+				const boxed = (content = "") => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
+				const selectedLine = (content: string) => {
+					const padded = padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth);
+					const highlighted = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
+					return `${theme.fg("borderMuted", "│ ")}${highlighted}${theme.fg("borderMuted", " │")}`;
+				};
+				const selected = profiles[selectedIndex];
+				const lines = [
+					border("╭", "─", "╮"),
+					boxed(theme.fg("text", bold(`Browser Profiles — ${browserLabel}`))),
+				];
+
+				if (!profiles.length) {
+					lines.push(
+						boxed(theme.fg("muted", "No profiles exist yet.")),
+						boxed(""),
+					);
+				} else {
+					lines.push(boxed(""));
+					const maxVisible = 6;
+					const visibleCount = Math.min(maxVisible, profiles.length);
+					const start = Math.max(0, Math.min(selectedIndex - Math.floor(visibleCount / 2), profiles.length - visibleCount));
+					const end = start + visibleCount;
+					const gap = "  ";
+					const column = (content: string, columnWidth: number) => padAnsiEnd(truncateAnsi(content, columnWidth), columnWidth);
+					const row = (columns: Array<[string, number]>) => columns.map(([content, columnWidth]) => column(content, columnWidth)).join(gap);
+					const nameWidth = Math.min(24, Math.max("Profile".length, ...profiles.map((entry) => entry.profile.length + 2)));
+					const statusWidth = Math.max(1, innerWidth - nameWidth - gap.length);
+
+					lines.push(boxed(row([
+						[theme.fg("dim", "Profile"), nameWidth],
+						[theme.fg("dim", "Status"), statusWidth],
+					])));
+					if (start > 0) lines.push(boxed(theme.fg("dim", `… ${start} earlier`)));
+					for (let index = start; index < end; index += 1) {
+						const entry = profiles[index]!;
+						const isSelected = index === selectedIndex;
+						const marker = isSelected ? theme.fg("accent", "›") : " ";
+						const dot = theme.fg(profileStatusColor(entry), entry.inUse ? "●" : "○");
+						const name = theme.fg(isSelected ? "accent" : "text", entry.profile);
+						const status = theme.fg(profileStatusColor(entry), profileStatusLabel(entry, ctx.cwd));
+						const renderedRow = row([
+							[`${marker} ${name}`, nameWidth],
+							[`${dot} ${status}`, statusWidth],
+						]);
+						lines.push(isSelected ? selectedLine(renderedRow) : boxed(renderedRow));
+					}
+					if (end < profiles.length) lines.push(boxed(theme.fg("dim", `… ${profiles.length - end} more`)));
+				}
+
+				const openLabel = selected?.inUse ? "connect" : "open";
+				const controls = deleteInProgress
+					? theme.fg("warning", "Deleting profile…")
+					: !profiles.length
+						? [
+							`${workflowKeycap(theme, "N", "accent")} new profile`,
+							`${workflowKeycap(theme, "Esc")} back`,
+						].join(theme.fg("dim", "  "))
+						: deleteArmed
+							? [
+								`${workflowKeycap(theme, "D", "warning")} confirm delete`,
+								`${workflowKeycap(theme, "Esc")} cancel`,
+							].join(theme.fg("dim", "  "))
+							: [
+								`${workflowKeycap(theme, "↑↓")} move`,
+								`${workflowKeycap(theme, "Enter", "accent")} ${openLabel}`,
+								`${workflowKeycap(theme, "N", "accent")} new`,
+								`${workflowKeycap(theme, "R", "accent")} rename`,
+								`${workflowKeycap(theme, "D", "accent")} delete`,
+								`${workflowKeycap(theme, "Esc")} back`,
+							].join(theme.fg("dim", "  "));
+
+				// A running profile cannot be renamed or deleted: the browser holding it would break,
+				// and it may belong to a Pi session in another project.
+				const hint = deleteArmed && selected
+					? theme.fg("warning", `Delete '${selected.profile}'? Signed-in sessions in it are lost.`)
+					: selected?.inUse
+						? theme.fg("dim", "Running profiles cannot be renamed or deleted. Enter connects to the browser.")
+						: "";
+				lines.push(boxed(""));
+				if (profiles.length) lines.push(boxed(hint));
+				lines.push(
+					boxed(controls),
+					border("╰", "─", "╯"),
+				);
+				return lines.map((item) => truncateAnsi(item, width));
+			},
+			invalidate(): void {},
+			handleInput(data: string): void {
+				const selected = profiles[selectedIndex];
+				const selectKey = matchSelectKey(data, keybindings);
+				if (deleteInProgress) return;
+				if (matchesShortcut(data, "n")) {
+					done({ type: "new" });
+					return;
+				}
+				if (selectKey === "up") {
+					if (!profiles.length) return;
+					selectedIndex = Math.max(0, selectedIndex - 1);
+					deleteArmed = false;
+					requestRender?.();
+					return;
+				}
+				if (selectKey === "down") {
+					if (!profiles.length) return;
+					selectedIndex = Math.min(profiles.length - 1, selectedIndex + 1);
+					deleteArmed = false;
+					requestRender?.();
+					return;
+				}
+				if (selectKey === "cancel") {
+					if (deleteArmed) {
+						deleteArmed = false;
+						requestRender?.();
+						return;
+					}
+					done({ type: "cancel" });
+					return;
+				}
+				if (!selected) return;
+				if (selectKey === "confirm") {
+					done({ type: "open", profile: selected });
+					return;
+				}
+				if (matchesShortcut(data, "r")) {
+					if (selected.inUse) {
+						ctx.ui.notify(`Cannot rename '${selected.profile}': a browser is running on it.`, "error");
+						return;
+					}
+					done({ type: "rename", profile: selected });
+					return;
+				}
+				if (matchesShortcut(data, "d")) {
+					if (selected.inUse) {
+						ctx.ui.notify(`Cannot delete '${selected.profile}': a browser is running on it.`, "error");
+						return;
+					}
+					if (deleteArmed) {
+						void deleteSelectedProfile(selected);
+						return;
+					}
+					deleteArmed = true;
+					requestRender?.();
+				}
+			},
+		};
+		return component;
+	}).finally(() => {
+		component = undefined;
+		requestRender = undefined;
+	});
 }
 
 /**
  * Ask which profile to open, showing which ones already have a browser running.
  *
  * Profiles are shared across projects, so launching blind means finding out about a collision only
- * after the fact. Picking a running profile is allowed and connects to that browser; the label says
- * so, and the start response repeats it.
+ * after the fact. Picking a running profile is allowed and connects to that browser.
  *
- * Returns the chosen profile name, or undefined when the user cancels.
+ * Returns the chosen profile name, or undefined when the user backs out.
  */
 async function chooseProfile(
 	ctx: ExtensionCommandContext | ExtensionContext,
 	manager: BrowserManager,
 	browserKey: string,
+	browserLabel: string,
 ): Promise<string | undefined> {
-	let entries: ProfileListEntry[] = [];
-	try {
-		const listed = await manager.execute({ action: "list_profiles", browserKey });
-		entries = (listed.details.profiles as ProfileListEntry[] | undefined) ?? [];
-	} catch {
-		// Discovery is a convenience. If the profile root cannot be read, fall through to naming one.
+	const listProfiles = async (): Promise<ProfileListEntry[]> => {
+		try {
+			const listed = await manager.execute({ action: "list_profiles", browserKey });
+			return (listed.details.profiles as ProfileListEntry[] | undefined) ?? [];
+		} catch {
+			// Discovery is a convenience; fall back to naming a profile outright.
+			return [];
+		}
+	};
+
+	while (true) {
+		const entries = await listProfiles();
+		const action = await showProfilePickerScreen(ctx, browserLabel, entries, async (profile) => {
+			const deleted = await manager.execute({ action: "delete_profile", browserKey, profile: profile.profile });
+			ctx.ui.notify(deleted.text, "info");
+			return listProfiles();
+		});
+
+		if (action.type === "cancel") return undefined;
+		if (action.type === "open") return action.profile.profile;
+		if (action.type === "new") {
+			const name = await promptForProfileName(ctx, "Profile name:", suggestProfileName(entries));
+			if (name) return name;
+			continue;
+		}
+
+		const renamed = await promptForProfileName(ctx, "Rename profile to:", action.profile.profile);
+		if (!renamed || renamed === action.profile.profile) continue;
+		try {
+			const result = await manager.execute({
+				action: "rename_profile",
+				browserKey,
+				profile: action.profile.profile,
+				targetProfile: renamed,
+			});
+			ctx.ui.notify(result.text, "info");
+		} catch (error) {
+			ctx.ui.notify((error as Error).message, "error");
+		}
 	}
-
-	if (!entries.length) return promptForProfileName(ctx, "default");
-
-	const options = [...entries.map((entry) => profileOptionLabel(entry, ctx.cwd)), NEW_PROFILE_LABEL];
-	const choice = await ctx.ui.select("Select a profile:", options);
-	if (!choice) return undefined;
-	if (choice === NEW_PROFILE_LABEL) return promptForProfileName(ctx, suggestProfileName(entries));
-
-	return entries[options.indexOf(choice)]?.profile;
 }
 
 /** Suggest a name no existing profile is using, so "New profile…" lands somewhere free. */
@@ -153,9 +381,10 @@ function suggestProfileName(entries: ProfileListEntry[]): string {
 
 async function promptForProfileName(
 	ctx: ExtensionCommandContext | ExtensionContext,
+	prompt: string,
 	suggestion: string,
 ): Promise<string | undefined> {
-	const entered = await ctx.ui.input("Profile name:", suggestion);
+	const entered = await ctx.ui.input(prompt, suggestion);
 	return entered?.trim() || undefined;
 }
 
@@ -975,7 +1204,8 @@ async function openBrowserSessionsManager(
 				const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
 				ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
 			} else if (action.type === "create") {
-				const chosenProfile = await chooseProfile(ctx, browserManager, config.defaultBrowser);
+				const defaultBrowserLabel = config.browsers[config.defaultBrowser]?.displayName ?? config.defaultBrowser;
+				const chosenProfile = await chooseProfile(ctx, browserManager, config.defaultBrowser, defaultBrowserLabel);
 				if (!chosenProfile) continue;
 
 				const existingNames = new Set(sessions.map((session) => session.name.toLowerCase()));
@@ -1088,6 +1318,8 @@ const BrowserToolSchema = Type.Object({
 		[
 			"list_browsers",
 			"list_profiles",
+			"rename_profile",
+			"delete_profile",
 			"start",
 			"attach",
 			"sessions",
@@ -1160,6 +1392,7 @@ const BrowserToolSchema = Type.Object({
 	workflowId: Type.Optional(Type.String({ description: "Saved workflow ID for workflow_replay, workflow_rename, workflow_delete, or workflow_export" })),
 	workflowName: Type.Optional(Type.String({ description: "Workflow name for recording or lookup" })),
 	targetWorkflowName: Type.Optional(Type.String({ description: "New workflow name for workflow_rename" })),
+	targetProfile: Type.Optional(Type.String({ description: "New profile name for rename_profile" })),
 	scriptFormat: Type.Optional(StringEnum(["puppeteer", "browser_tool"] as const)),
 });
 
@@ -1300,6 +1533,7 @@ export default function (pi: ExtensionAPI) {
 			"Use browser inspect or browser extract_text instead of dumping large page HTML into context.",
 			"Use workflow_list, workflow_replay, and workflow_details for saved workflow execution; use browser workflow_record_start/workflow_record_stop to record new workflows.",
 			"Profiles are shared across projects. Use browser list_profiles before starting a session on a named profile: starting on one that is already running connects to that browser instead of opening a new window.",
+			"Use rename_profile and delete_profile to manage saved profiles. Neither works while a browser is running on the profile, and delete_profile permanently discards its signed-in sessions, so confirm with the user first.",
 		],
 		parameters: BrowserToolSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

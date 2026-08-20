@@ -10,6 +10,8 @@ export type ScriptFormat = "puppeteer" | "browser_tool";
 export type BrowserAction =
 	| "list_browsers"
 	| "list_profiles"
+	| "rename_profile"
+	| "delete_profile"
 	| "start"
 	| "attach"
 	| "sessions"
@@ -157,6 +159,8 @@ export interface BrowserToolInput {
 	workflowId?: string;
 	workflowName?: string;
 	targetWorkflowName?: string;
+	/** New profile name for rename_profile. */
+	targetProfile?: string;
 	scriptFormat?: ScriptFormat;
 }
 

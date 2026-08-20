@@ -127,10 +127,19 @@ a different project. Ask before you launch:
 
 - “List my browser profiles.” (`list_profiles`) reports every profile and whether it is in use, and
   names the project that started it.
-- Creating a session from the Browser Manager shows the same list and lets you pick.
+- Creating a session from the Browser Manager opens a profile picker showing the same list.
 
 Only one browser can run per profile, so starting a session on a profile that is already running
 connects you to that browser rather than opening a second window.
+
+### Managing profiles
+
+The profile picker doubles as a profile manager — `N` for a new profile, `R` to rename, `D` twice to
+delete. The same actions are available to Pi as `rename_profile` and `delete_profile`.
+
+Neither works while a browser is running on the profile, including one started by Pi in another
+project: close it first. Deleting a profile permanently discards everything it holds, including the
+sites it was signed in to.
 
 ## Screenshots and recordings
 
