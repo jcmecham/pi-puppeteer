@@ -5,7 +5,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ensureStorageDir, loadConfig } from "./config.ts";
-import { BrowserManager } from "./manager.ts";
+import { BrowserManager, sanitizeSegment } from "./manager.ts";
 import type { BrowserToolInput, RawExtensionConfig, ResolvedConfig, SessionSummary, WorkflowStep } from "./types.ts";
 
 async function writeProjectDefaultBrowser(cwd: string, config: ResolvedConfig, browserKey: string): Promise<void> {
@@ -157,16 +157,7 @@ async function showProfilePickerScreen(
 		};
 		component = {
 			render(width: number): string[] {
-				const minWidth = Math.max(24, width);
-				const innerWidth = Math.max(1, minWidth - 4);
-				const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
-				const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
-				const boxed = (content = "") => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
-				const selectedLine = (content: string) => {
-					const padded = padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth);
-					const highlighted = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
-					return `${theme.fg("borderMuted", "│ ")}${highlighted}${theme.fg("borderMuted", " │")}`;
-				};
+				const { innerWidth, bold, border, boxed, selectedLine, clamp } = screenFrame(theme, width);
 				const selected = profiles[selectedIndex];
 				const lines = [
 					border("╭", "─", "╮"),
@@ -246,7 +237,7 @@ async function showProfilePickerScreen(
 					boxed(controls),
 					border("╰", "─", "╯"),
 				);
-				return lines.map((item) => truncateAnsi(item, width));
+				return clamp(lines);
 			},
 			invalidate(): void {},
 			handleInput(data: string): void {
@@ -348,13 +339,27 @@ async function chooseProfile(
 
 		if (action.type === "cancel") return undefined;
 		if (action.type === "open") return action.profile.profile;
+
+		const takenNames = entries.map((entry) => entry.profile);
 		if (action.type === "new") {
-			const name = await promptForProfileName(ctx, "Profile name:", suggestProfileName(entries));
+			const name = await showProfileNameScreen(ctx, {
+				title: "New Profile",
+				confirmLabel: "create",
+				browserLabel,
+				initial: suggestProfileName(entries),
+				taken: takenNames,
+			});
 			if (name) return name;
 			continue;
 		}
 
-		const renamed = await promptForProfileName(ctx, "Rename profile to:", action.profile.profile);
+		const renamed = await showProfileNameScreen(ctx, {
+			title: "Rename Profile",
+			confirmLabel: "rename",
+			browserLabel,
+			initial: action.profile.profile,
+			taken: takenNames,
+		});
 		if (!renamed || renamed === action.profile.profile) continue;
 		try {
 			const result = await manager.execute({
@@ -379,13 +384,166 @@ function suggestProfileName(entries: ProfileListEntry[]): string {
 	return `default-${suffix}`;
 }
 
-async function promptForProfileName(
+export interface ProfileNameState {
+	/** What the name becomes on disk; empty when nothing usable was typed. */
+	sanitized: string;
+	collides: boolean;
+	canConfirm: boolean;
+}
+
+/**
+ * Judge a typed profile name once, for both the status line and the Enter key.
+ *
+ * Profile names become directory segments, so what is typed is not always what is stored. Deciding
+ * it in one place keeps the status line and the key handler from drifting apart.
+ */
+export function profileNameState(value: string, initial: string, taken: Iterable<string>): ProfileNameState {
+	const sanitized = sanitizeSegment(value, "");
+	const takenNames = new Set([...taken].map((name) => name.toLowerCase()));
+	const collides = sanitized.toLowerCase() !== initial.toLowerCase() && takenNames.has(sanitized.toLowerCase());
+	return { sanitized, collides, canConfirm: Boolean(sanitized) && !collides };
+}
+
+/** Printable text, including a paste. Escape sequences and control keys are handled separately. */
+export function printableInput(data: string): string | undefined {
+	if (!data.length) return undefined;
+	for (const character of data) {
+		const code = character.codePointAt(0) ?? 0;
+		if (code < 32 || code === 127) return undefined;
+	}
+	return data;
+}
+
+/**
+ * Text entry for a profile name, rendered in the Browser Manager's frame.
+ *
+ * Profile names become directory segments, so what you type is not always what is stored. The field
+ * shows the sanitized result as you type and refuses a name that is already taken, rather than
+ * letting the manager reject it afterwards.
+ */
+async function showProfileNameScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
-	prompt: string,
-	suggestion: string,
+	options: { title: string; confirmLabel: string; browserLabel: string; initial: string; taken: string[] },
 ): Promise<string | undefined> {
-	const entered = await ctx.ui.input(prompt, suggestion);
-	return entered?.trim() || undefined;
+	let value = options.initial;
+	let cursor = value.length;
+	let requestRender: (() => void) | undefined;
+	let component: RecordingScreenComponent | undefined;
+
+	return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+		requestRender = () => tui.requestRender();
+		component = {
+			render(width: number): string[] {
+				const { innerWidth, bold, border, boxed, clamp } = screenFrame(theme, width);
+
+				const label = "Name  ";
+				const fieldWidth = Math.max(8, innerWidth - label.length);
+				// Keep the cursor on screen for names longer than the field.
+				const start = Math.max(0, Math.min(cursor - fieldWidth + 1, Math.max(0, value.length - fieldWidth + 1)));
+				const visible = value.slice(start, start + fieldWidth);
+				const localCursor = cursor - start;
+				const before = visible.slice(0, localCursor);
+				const atCursor = visible.slice(localCursor, localCursor + 1) || " ";
+				const after = visible.slice(localCursor + 1);
+				const cursorCell = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", atCursor) : theme.fg("accent", atCursor);
+				const field = `${theme.fg("dim", label)}${theme.fg("text", before)}${cursorCell}${theme.fg("text", after)}`;
+
+				const { sanitized, collides, canConfirm } = profileNameState(value, options.initial, options.taken);
+				const status = !sanitized
+					? theme.fg("dim", "Enter a profile name.")
+					: collides
+						? theme.fg("error", `A profile named '${sanitized}' already exists.`)
+						: sanitized !== value
+							? theme.fg("warning", `Saved as '${sanitized}'.`)
+							: theme.fg("dim", `${options.browserLabel} profile.`);
+
+				const controls = [
+					canConfirm
+						? `${workflowKeycap(theme, "Enter", "accent")} ${options.confirmLabel}`
+						: theme.fg("dim", `[Enter] ${options.confirmLabel}`),
+					`${workflowKeycap(theme, "Esc")} cancel`,
+				].join(theme.fg("dim", "  "));
+
+				return clamp([
+					border("╭", "─", "╮"),
+					boxed(theme.fg("text", bold(`${options.title} — ${options.browserLabel}`))),
+					boxed(""),
+					boxed(field),
+					boxed(""),
+					boxed(status),
+					boxed(controls),
+					border("╰", "─", "╯"),
+				]);
+			},
+			invalidate(): void {},
+			handleInput(data: string): void {
+				// Typing wins over every binding: a select keybinding on a letter must not eat input.
+				const typed = printableInput(data);
+				if (typed) {
+					value = value.slice(0, cursor) + typed + value.slice(cursor);
+					cursor += typed.length;
+					requestRender?.();
+					return;
+				}
+
+				if (data === "\x7f" || data === "\b") {
+					if (cursor > 0) {
+						value = value.slice(0, cursor - 1) + value.slice(cursor);
+						cursor -= 1;
+						requestRender?.();
+					}
+					return;
+				}
+				if (data === "\x1b[3~") {
+					if (cursor < value.length) {
+						value = value.slice(0, cursor) + value.slice(cursor + 1);
+						requestRender?.();
+					}
+					return;
+				}
+				if (data === "\x15") {
+					value = value.slice(cursor);
+					cursor = 0;
+					requestRender?.();
+					return;
+				}
+				if (data === "\x1b[D") {
+					cursor = Math.max(0, cursor - 1);
+					requestRender?.();
+					return;
+				}
+				if (data === "\x1b[C") {
+					cursor = Math.min(value.length, cursor + 1);
+					requestRender?.();
+					return;
+				}
+				if (data === "\x1b[H" || data === "\x1b[1~") {
+					cursor = 0;
+					requestRender?.();
+					return;
+				}
+				if (data === "\x1b[F" || data === "\x1b[4~") {
+					cursor = value.length;
+					requestRender?.();
+					return;
+				}
+
+				const selectKey = matchSelectKey(data, keybindings);
+				if (selectKey === "cancel") {
+					done(undefined);
+					return;
+				}
+				if (selectKey === "confirm") {
+					const { sanitized, canConfirm } = profileNameState(value, options.initial, options.taken);
+					if (canConfirm) done(sanitized);
+				}
+			},
+		};
+		return component;
+	}).finally(() => {
+		component = undefined;
+		requestRender = undefined;
+	});
 }
 
 interface WorkflowStatusUiContext {
@@ -570,6 +728,47 @@ type RecordingScreenComponent = {
 	invalidate(): void;
 };
 
+interface ScreenTheme {
+	fg: (color: any, text: string) => string;
+	bold?: (text: string) => string;
+	bg?: (color: any, text: string) => string;
+}
+
+export interface ScreenFrame {
+	innerWidth: number;
+	bold(text: string): string;
+	border(left: string, fill: string, right: string): string;
+	boxed(content?: string): string;
+	selectedLine(content: string): string;
+	/** Trim finished lines to the real terminal width. */
+	clamp(lines: string[]): string[];
+}
+
+/**
+ * The bordered box every Pi-puppeteer screen is drawn in.
+ *
+ * Shared so the screens stay visually identical: they are meant to read as one surface, and five
+ * copies of this arithmetic drifted apart the moment any of them was adjusted.
+ */
+export function screenFrame(theme: ScreenTheme, width: number): ScreenFrame {
+	const minWidth = Math.max(24, width);
+	const innerWidth = Math.max(1, minWidth - 4);
+	const fit = (content: string) => padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth);
+
+	return {
+		innerWidth,
+		bold: (text) => (typeof theme.bold === "function" ? theme.bold(text) : text),
+		border: (left, fill, right) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`),
+		boxed: (content = "") => `${theme.fg("borderMuted", "│ ")}${fit(content)}${theme.fg("borderMuted", " │")}`,
+		selectedLine: (content) => {
+			const padded = fit(content);
+			const highlighted = typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
+			return `${theme.fg("borderMuted", "│ ")}${highlighted}${theme.fg("borderMuted", " │")}`;
+		},
+		clamp: (lines) => lines.map((line) => truncateAnsi(line, width)),
+	};
+}
+
 type SelectKeyAction = "up" | "down" | "confirm" | "cancel";
 
 const SELECT_KEYBINDINGS: Record<SelectKeyAction, "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel"> = {
@@ -638,11 +837,7 @@ async function showWorkflowRecordingScreen(
 					const recording = activeRecording ?? initialRecording;
 					const recentSteps = recording.recentSteps ?? [];
 					const hiddenCount = Math.max(0, recording.stepCount - recentSteps.length);
-					const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
-					const minWidth = Math.max(24, width);
-					const innerWidth = Math.max(1, minWidth - 4);
-					const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
-					const boxed = (content: string) => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
+					const { innerWidth, bold, border, boxed, clamp } = screenFrame(theme, width);
 					const target = recording.sessionId && recording.tabId ? `${recording.sessionId}/${recording.tabId}` : "browser page";
 					const lines = [
 						border("╭", "─", "╮"),
@@ -668,7 +863,7 @@ async function showWorkflowRecordingScreen(
 						boxed(`${theme.fg("dim", "Controls")}  ${controls}`),
 						border("╰", "─", "╯"),
 					);
-					return lines.map((line) => truncateAnsi(line, width));
+					return clamp(lines);
 				},
 				handleInput(data: string): void {
 					const selectKey = matchSelectKey(data, keybindings);
@@ -703,11 +898,7 @@ async function showWorkflowLibraryScreen(
 		requestRender = () => tui.requestRender();
 		component = {
 			render(width: number): string[] {
-				const minWidth = Math.max(24, width);
-				const innerWidth = Math.max(1, minWidth - 4);
-				const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
-				const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
-				const boxed = (content: string) => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
+				const { innerWidth, bold, border, boxed, clamp } = screenFrame(theme, width);
 				const selected = workflows[selectedIndex];
 				const lines = [
 					border("╭", "─", "╮"),
@@ -757,7 +948,7 @@ async function showWorkflowLibraryScreen(
 					boxed(`${theme.fg("dim", deleteArmed ? "Delete armed" : "Controls")}  ${controls}`),
 					border("╰", "─", "╯"),
 				);
-				return lines.map((line) => truncateAnsi(line, width));
+				return clamp(lines);
 			},
 			invalidate(): void {},
 			handleInput(data: string): void {
@@ -1005,16 +1196,7 @@ async function showBrowserSessionsScreen(
 		};
 		component = {
 			render(width: number): string[] {
-				const minWidth = Math.max(24, width);
-				const innerWidth = Math.max(1, minWidth - 4);
-				const bold = (text: string) => ("bold" in theme && typeof theme.bold === "function" ? theme.bold(text) : text);
-				const border = (left: string, fill: string, right: string) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`);
-				const boxed = (content = "") => `${theme.fg("borderMuted", "│ ")}${padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth)}${theme.fg("borderMuted", " │")}`;
-				const selectedLine = (content: string) => {
-					const padded = padAnsiEnd(truncateAnsi(content, innerWidth), innerWidth);
-					const highlighted = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", padded) : padded;
-					return `${theme.fg("borderMuted", "│ ")}${highlighted}${theme.fg("borderMuted", " │")}`;
-				};
+				const { innerWidth, bold, border, boxed, selectedLine, clamp } = screenFrame(theme, width);
 				const selected = sessions[selectedIndex];
 				const lines = [
 					border("╭", "─", "╮"),
@@ -1102,7 +1284,7 @@ async function showBrowserSessionsScreen(
 					boxed(controls),
 					border("╰", "─", "╯"),
 				);
-				return lines.map((item) => truncateAnsi(item, width));
+				return clamp(lines);
 			},
 			invalidate(): void {},
 			handleInput(data: string): void {

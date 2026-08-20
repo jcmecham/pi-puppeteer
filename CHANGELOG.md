@@ -40,12 +40,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `rename_profile` and `delete_profile` actions, with rename and delete also available from the
   profile picker. Both refuse while a browser is running on the profile, including one started by Pi
   in another project.
+- Naming a profile now happens on its own screen in the Browser Manager's frame, previewing the name
+  as it will be stored and refusing one that is already taken.
 - `profileScope` config key (`"global"` or `"project"`, default `"global"`).
 - `<cwd>/.pi/.pi-puppeteer/.gitignore` is written whenever the storage directory exists, so runtime
   state cannot be staged by accident.
 - Migration results are reported at session start, covering moved, deferred, and conflicting profiles.
-- `npm run verify:storage`, a dependency-free harness covering the storage layout and migration, wired
-  into `npm run validate` and run on both Ubuntu and Windows in CI.
+- `npm run verify`, a dependency-free harness covering the storage layout, migration, profile
+  discovery and management, and screen geometry, wired into `npm run validate` and run on both Ubuntu
+  and Windows in CI.
 
 ### Fixed
 

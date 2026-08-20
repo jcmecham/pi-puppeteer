@@ -137,6 +137,9 @@ connects you to that browser rather than opening a second window.
 The profile picker doubles as a profile manager — `N` for a new profile, `R` to rename, `D` twice to
 delete. The same actions are available to Pi as `rename_profile` and `delete_profile`.
 
+Profile names become directory names, so the naming screen previews what will actually be stored
+(`My Work!` is saved as `My-Work`) and refuses a name that is already in use.
+
 Neither works while a browser is running on the profile, including one started by Pi in another
 project: close it first. Deleting a profile permanently discards everything it holds, including the
 sites it was signed in to.

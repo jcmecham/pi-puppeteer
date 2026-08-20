@@ -41,8 +41,8 @@
     "clean": "node -e \"const fs=require('node:fs'); for (const p of ['coverage','dist','build','tsconfig.tsbuildinfo']) fs.rmSync(p,{recursive:true,force:true});\"",
     "build": "npm run check",
     "check": "tsc --noEmit",
-    "verify:storage": "tsx scripts/verify-storage.ts",
-    "validate": "npm run clean && npm run check && npm run verify:storage",
+    "verify": "tsx scripts/verify.ts",
+    "validate": "npm run clean && npm run check && npm run verify",
     "publish:check": "npm run validate && npm pack --dry-run",
     "configure": "tsx scripts/configure.ts",
     "prepublishOnly": "npm run validate"

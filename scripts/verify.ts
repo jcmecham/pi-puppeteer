@@ -2,11 +2,11 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Storage layout checks for the profile roots and the migration in src/config.ts. The repository has
-// no unit-test framework, and `tsc --noEmit` cannot see any of this behaviour, so this harness runs
-// the real loadConfig against synthetic project trees under the OS temp directory.
+// Behavioural checks for storage layout, profile discovery and management, and screen geometry. The
+// repository has no unit-test framework and `tsc --noEmit` sees none of this, so the harness runs the
+// real code against synthetic project trees under the OS temp directory.
 //
-//   npx tsx scripts/verify-storage.ts
+//   npx tsx scripts/verify.ts
 
 const ROOT = join(tmpdir(), `pi-puppeteer-verify-${process.pid}`);
 const AGENT_DIR = join(ROOT, "agent");
@@ -232,6 +232,46 @@ console.log("\nprofile management");
 		() => manager.execute({ action: "delete_profile", browserKey, profile: "gone" }),
 		"No profile",
 	);
+}
+
+console.log("\nprofile name entry");
+
+{
+	const { profileNameState, printableInput, screenFrame } = await import("../src/index.ts");
+
+	const taken = ["default", "work"];
+	check("a free name can be confirmed", profileNameState("scratch", "", taken).canConfirm);
+	check("a taken name is refused", !profileNameState("work", "", taken).canConfirm);
+	check("a taken name is reported as a collision", profileNameState("work", "", taken).collides);
+	check("case does not sneak a duplicate past", !profileNameState("WORK", "", taken).canConfirm);
+	check("renaming to the current name is allowed", profileNameState("work", "work", taken).canConfirm);
+	check("an empty name cannot be confirmed", !profileNameState("   ", "", taken).canConfirm);
+	// Illegal runs collapse to a dash and trailing dashes are trimmed, so the preview shows "My-Work".
+	check("illegal characters are shown sanitized", profileNameState("My Work!", "", taken).sanitized === "My-Work", JSON.stringify(profileNameState("My Work!", "", taken)));
+	check("a traversal cannot be confirmed as itself", profileNameState("..", "", taken).sanitized === "");
+
+	check("typed text is accepted", printableInput("abc") === "abc");
+	check("a paste is accepted whole", printableInput("my profile") === "my profile");
+	check("Enter is not treated as text", printableInput("\r") === undefined);
+	check("Escape sequences are not treated as text", printableInput("\x1b[D") === undefined);
+	check("backspace is not treated as text", printableInput("\x7f") === undefined);
+
+	// A real theme emits ANSI, which the padding helpers do not count; a zero-width stub isolates
+	// the geometry.
+	const theme = { fg: (_color: unknown, text: string) => text, bold: (text: string) => text, bg: (_color: unknown, text: string) => text };
+	for (const width of [24, 40, 80, 120]) {
+		const frame = screenFrame(theme, width);
+		const lines = frame.clamp([
+			frame.border("╭", "─", "╮"),
+			frame.boxed(frame.bold("New Profile — Microsoft Edge")),
+			frame.boxed(""),
+			frame.selectedLine("› work          ● in use by session-1"),
+			frame.boxed("[Enter] create  [Esc] cancel"),
+			frame.border("╰", "─", "╯"),
+		]);
+		const rendered = [...new Set(lines.map((line) => [...line].length))];
+		check(`every line is exactly ${width} columns`, rendered.length === 1 && rendered[0] === width, rendered.join("/"));
+	}
 }
 
 rmSync(ROOT, { recursive: true, force: true });

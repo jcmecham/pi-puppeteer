@@ -60,7 +60,7 @@ function truncate(value: string, max = 4000): string {
 
 // Profile names become path segments under a shared root, so `.` and `..` must never survive: a
 // profile named ".." would resolve outside the profile root and into the Pi agent directory.
-function sanitizeSegment(value: string | undefined, fallback: string): string {
+export function sanitizeSegment(value: string | undefined, fallback: string): string {
 	const base = (value ?? fallback).trim() || fallback;
 	const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "");
 	return cleaned || fallback;
