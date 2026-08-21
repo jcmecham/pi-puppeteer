@@ -29,6 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   no action a user could take to clear it. Lock files are now tested rather than counted: Windows asks
   the OS whether the marker is actually held, and POSIX reads the pid out of the lock symlink so a
   crashed browser's leftovers are recognised as stale.
+- A truncated cell no longer bleeds its colour across the rest of the row. Cutting a styled string to
+  fit a column dropped that style's reset, so a long browser or profile name coloured the padding
+  after it and ran on into the next column, and on into the border.
 
 ### Changed
 
@@ -42,6 +45,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `.pi-puppeteer-profile.json` file inside it. Existing profiles need no migration and are not moved.
 - `rename_profile` now works while a browser is running on the profile, because it no longer moves
   anything on disk. `delete_profile` still requires the profile to be idle.
+- The Browser Manager no longer changes height while you use it. Its screens are drawn inline rather
+  than as an overlay, so every line the box grew or shrank by repainted everything below it — and the
+  box grew or shrank on almost every keypress: the `… earlier` / `… more` markers appeared only when
+  the list overflowed, `S save profile` only for a throwaway session, the warning row only when a
+  close was armed, and closing collapsed the whole control block to one line. All of those rows are
+  now always reserved, and a hint that does not apply is dimmed rather than removed. The screen's
+  height is now decided by the number of rows and the terminal width, and by nothing else; the
+  profile picker and the new default-browser picker are held to the same rule.
+- Renaming a browser and changing the default browser are drawn in the Browser Manager's own frame
+  instead of dropping out to a generic prompt and list. Renaming a browser now also rejects a blank
+  or duplicate name in the field, the way naming a profile does.
+- Opening, showing, closing, renaming, and saving a browser now run with the Browser Manager still on
+  screen, saying what they are doing, rather than handing the terminal back to the editor for the
+  duration. Looking for profiles does the same, which matters most where it is slowest: discovery
+  probes each profile with a timeout, and that wait used to happen on a blank editor.
 
 ## [0.3.0] - 2026-08-20
 

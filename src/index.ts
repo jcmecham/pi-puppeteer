@@ -81,14 +81,95 @@ function defaultBrowserOptions(config: ResolvedConfig): Array<{ key: string; lab
 	];
 }
 
+/** How many browsers the default-browser picker shows before it starts scrolling. */
+const DEFAULT_BROWSERS_VISIBLE = 6;
+
+export interface DefaultBrowserState {
+	options: Array<{ key: string; label: string }>;
+	selectedIndex: number;
+}
+
+/**
+ * The default-browser picker's lines, in the Browser Manager's frame.
+ *
+ * This used to be `ctx.ui.select`, which drops the user out of the surface the rest of the flow is
+ * drawn on. Same frame, same primitives, same height rule as every other list here.
+ */
+export function defaultBrowserLines(theme: ScreenTheme, width: number, state: DefaultBrowserState): string[] {
+	const { options, selectedIndex } = state;
+	const frame = screenFrame(theme, width);
+	const { innerWidth, bold, border, boxed, clamp } = frame;
+	const lines = [
+		border("╭", "─", "╮"),
+		boxed(theme.fg("text", bold("Default Browser"))),
+		boxed(theme.fg("muted", "Used by every browser this project opens without naming one.")),
+		boxed(""),
+	];
+
+	lines.push(...listRows(frame, {
+		items: options,
+		selectedIndex,
+		maxVisible: DEFAULT_BROWSERS_VISIBLE,
+		row: (option, isSelected) => {
+			const marker = isSelected ? theme.fg("accent", "›") : " ";
+			return tableRow([[`${marker} ${theme.fg(isSelected ? "accent" : "text", option.label)}`, innerWidth]]);
+		},
+	}));
+
+	lines.push(
+		boxed(""),
+		...controlBlock(theme, frame, [[
+			`${workflowKeycap(theme, "↑↓")} move`,
+			`${workflowKeycap(theme, "Enter", "accent")} select`,
+			`${workflowKeycap(theme, "Esc")} back`,
+		]], 0),
+		border("╰", "─", "╯"),
+	);
+	return clamp(lines);
+}
+
 async function chooseDefaultBrowser(
 	ctx: ExtensionCommandContext | ExtensionContext,
 	config: ResolvedConfig,
 ): Promise<string | undefined> {
 	const options = defaultBrowserOptions(config);
-	const choice = await ctx.ui.select("Select default browser:", options.map((option) => option.label));
-	if (!choice) return undefined;
-	return options.find((option) => option.label === choice)?.key;
+	if (!options.length) return undefined;
+	// Start on whichever option is already in force, so Enter is a no-op rather than a surprise.
+	let selectedIndex = Math.max(0, options.findIndex((option) => option.key === config.defaultBrowserSetting));
+	let requestRender: (() => void) | undefined;
+	let component: RecordingScreenComponent | undefined;
+
+	return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+		requestRender = () => tui.requestRender();
+		component = {
+			render(width: number): string[] {
+				return defaultBrowserLines(theme, width, { options, selectedIndex });
+			},
+			invalidate(): void {},
+			handleInput(data: string): void {
+				const selectKey = matchSelectKey(data, keybindings);
+				if (selectKey === "up") {
+					selectedIndex = Math.max(0, selectedIndex - 1);
+					requestRender?.();
+					return;
+				}
+				if (selectKey === "down") {
+					selectedIndex = Math.min(options.length - 1, selectedIndex + 1);
+					requestRender?.();
+					return;
+				}
+				if (selectKey === "cancel") {
+					done(undefined);
+					return;
+				}
+				if (selectKey === "confirm") done(options[selectedIndex]?.key);
+			},
+		};
+		return component;
+	}).finally(() => {
+		component = undefined;
+		requestRender = undefined;
+	});
 }
 
 interface ProfileListEntry {
@@ -108,6 +189,18 @@ type ProfilePickerAction =
 	| { type: "new" }
 	| { type: "rename"; profile: ProfileListEntry };
 
+/**
+ * Work a screen runs once it is mounted, rather than something awaited before it appears.
+ *
+ * Resolving `ctx.ui.custom` hands the terminal back to the editor, so an await sitting between two
+ * screens is painted as the frame vanishing and coming back. Handing the follow-up work to the next
+ * screen instead means the swap has nothing to wait for.
+ */
+interface PendingScreenWork {
+	message: string;
+	run: () => Promise<void>;
+}
+
 /** Status text for a profile row, in the same voice the sessions table uses. */
 function profileStatusLabel(entry: ProfileListEntry, cwd: string): string {
 	if (entry.sessionId) return `in use by ${entry.sessionId}`;
@@ -122,131 +215,185 @@ function profileStatusColor(entry: ProfileListEntry): "success" | "warning" | "m
 	return entry.inUse ? "success" : "muted";
 }
 
+/** How many profile rows the picker shows before it starts scrolling. */
+const PROFILES_VISIBLE = 6;
+
+export interface ProfilePickerState {
+	browserLabel: string;
+	profiles: ProfileListEntry[];
+	selectedIndex: number;
+	deleteArmed: boolean;
+	/** What is running right now. Shown in the reserved notice row, with the controls dimmed. */
+	busy?: string;
+	/** Resolves "running in this project" against the project the picker was opened from. */
+	cwd: string;
+}
+
+/**
+ * The profile picker's lines, at a height that depends only on the profile count and the width.
+ *
+ * Built from the same primitives as `browserManagerLines`, and held to the same invariant, because
+ * the two are meant to read as one surface — see `screenFrame`.
+ */
+export function profilePickerLines(theme: ScreenTheme, width: number, state: ProfilePickerState): string[] {
+	const { browserLabel, profiles, selectedIndex, deleteArmed, busy, cwd } = state;
+	const frame = screenFrame(theme, width);
+	const { innerWidth, bold, dim, border, boxed, clamp } = frame;
+	const selected = profiles[selectedIndex];
+	const lines = [
+		border("╭", "─", "╮"),
+		boxed(theme.fg("text", bold(`Browser Profiles — ${browserLabel}`))),
+	];
+
+	if (!profiles.length) {
+		lines.push(
+			boxed(theme.fg("muted", busy ? "" : "No profiles exist yet.")),
+			boxed(""),
+		);
+	} else {
+		lines.push(boxed(""));
+		const gap = "  ";
+		const nameWidth = Math.min(24, Math.max("Profile".length, ...profiles.map((entry) => entry.profile.length + 2)));
+		const statusWidth = Math.max(1, innerWidth - nameWidth - gap.length);
+
+		lines.push(boxed(tableRow([[dim("Profile"), nameWidth], [dim("Status"), statusWidth]], gap)));
+		lines.push(...listRows(frame, {
+			items: profiles,
+			selectedIndex,
+			maxVisible: PROFILES_VISIBLE,
+			row: (entry, isSelected) => {
+				const marker = isSelected ? theme.fg("accent", "›") : " ";
+				const dot = theme.fg(profileStatusColor(entry), entry.inUse ? "●" : "○");
+				const name = theme.fg(isSelected ? "accent" : "text", entry.profile);
+				const status = theme.fg(profileStatusColor(entry), profileStatusLabel(entry, cwd));
+				return tableRow([[`${marker} ${name}`, nameWidth], [`${dot} ${status}`, statusWidth]], gap);
+			},
+		}));
+	}
+
+	const hint = (key: string, label: string, options: { color?: "accent" | "warning" | "dim"; enabled?: boolean } = {}) => {
+		const enabled = (options.enabled ?? true) && !busy;
+		return `${workflowKeycap(theme, key, enabled ? options.color ?? "accent" : "dim")} ${enabled ? label : dim(label)}`;
+	};
+	// `open` and `connect` are different lengths, so both variants are handed to `controlBlock`:
+	// otherwise moving the cursor onto a running profile could rewrap the row and move the border.
+	const listHints = (openLabel: string) => [
+		hint("↑↓", "move", { color: "dim" }),
+		hint("Enter", openLabel),
+		hint("N", "new"),
+		hint("R", "rename"),
+		hint("D", "delete", { enabled: selected?.inUse !== true }),
+		hint("Esc", "back", { color: "dim" }),
+	];
+	const hintSets = profiles.length
+		? [
+			listHints("open"),
+			listHints("connect"),
+			[hint("D", "confirm delete", { color: "warning" }), hint("Esc", "cancel", { color: "dim" })],
+		]
+		: [[hint("N", "new profile"), hint("Esc", "back", { color: "dim" })]];
+	const activeHints = !profiles.length ? 0 : deleteArmed ? 2 : selected?.inUse ? 1 : 0;
+
+	// A running profile cannot be deleted: removing a live user data dir breaks the browser
+	// holding it, which may belong to a Pi session in another project. Renaming is safe —
+	// the name lives in a sidecar, so nothing on disk moves.
+	const notice = busy
+		? theme.fg("warning", busy)
+		: deleteArmed && selected
+			? theme.fg("warning", `Delete '${selected.profile}'? Signed-in sessions in it are lost.`)
+			: selected?.inUse
+				? dim("Running profiles cannot be deleted. Enter connects to the browser.")
+				: "";
+	lines.push(
+		boxed(""),
+		boxed(notice),
+		...controlBlock(theme, frame, hintSets, activeHints),
+		border("╰", "─", "╯"),
+	);
+	return clamp(lines);
+}
+
 /**
  * Profile picker, rendered in the same frame as the Browser Manager.
  *
  * Deleting happens in place behind a confirm, the way closing a session does. Renaming needs a text
- * prompt, which cannot run inside the custom screen, so it exits and the caller re-enters.
+ * field, which is its own screen, so it exits and the caller re-enters.
  */
 async function showProfilePickerScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
 	browserLabel: string,
-	profiles: ProfileListEntry[],
-	onDeleteProfile: (profile: ProfileListEntry) => Promise<ProfileListEntry[]>,
+	initialProfiles: ProfileListEntry[],
+	loadProfiles: () => Promise<ProfileListEntry[]>,
+	deleteProfile: (profile: ProfileListEntry) => Promise<void>,
+	pending?: PendingScreenWork,
 ): Promise<ProfilePickerAction> {
+	let profiles = initialProfiles;
 	let selectedIndex = 0;
 	let deleteArmed = false;
-	let deleteInProgress = false;
+	let busy: string | undefined;
+	let generation = 0;
 	let requestRender: (() => void) | undefined;
 	let component: RecordingScreenComponent | undefined;
 
 	return ctx.ui.custom<ProfilePickerAction>((tui, theme, keybindings, done) => {
 		requestRender = () => tui.requestRender();
-		const deleteSelectedProfile = async (profile: ProfileListEntry) => {
-			if (deleteInProgress) return;
-			deleteInProgress = true;
+		// Latest load wins. The refresh on mount can still be probing when a delete starts its own,
+		// and the older result must neither overwrite the newer list nor clear the newer notice.
+		const reload = async (message?: string) => {
+			const mine = ++generation;
+			if (message) busy = message;
 			requestRender?.();
 			try {
-				profiles = await onDeleteProfile(profile);
+				const loaded = await loadProfiles();
+				if (mine !== generation) return;
+				profiles = loaded;
 				selectedIndex = profiles.length ? Math.min(selectedIndex, profiles.length - 1) : 0;
+			} catch {
+				// Discovery is a convenience; an empty list still lets the caller name a profile outright.
+			} finally {
+				if (mine === generation) {
+					busy = undefined;
+					requestRender?.();
+				}
+			}
+		};
+		// Probing each profile can take a while, so it runs against the mounted screen. Only say so
+		// when there is nothing to show yet; a refresh over an existing list should be silent.
+		if (pending) {
+			void (async () => {
+				busy = pending.message;
+				requestRender?.();
+				try {
+					await pending.run();
+				} catch (error) {
+					ctx.ui.notify((error as Error).message, "error");
+				}
+				await reload();
+			})();
+		} else {
+			void reload(profiles.length ? undefined : "Looking for profiles…");
+		}
+
+		const deleteSelectedProfile = async (profile: ProfileListEntry) => {
+			busy = "Deleting profile…";
+			deleteArmed = false;
+			requestRender?.();
+			try {
+				await deleteProfile(profile);
 			} catch (error) {
 				ctx.ui.notify((error as Error).message, "error");
-			} finally {
-				deleteArmed = false;
-				deleteInProgress = false;
-				requestRender?.();
 			}
+			await reload();
 		};
 		component = {
 			render(width: number): string[] {
-				const { innerWidth, bold, border, boxed, selectedLine, clamp } = screenFrame(theme, width);
-				const selected = profiles[selectedIndex];
-				const lines = [
-					border("╭", "─", "╮"),
-					boxed(theme.fg("text", bold(`Browser Profiles — ${browserLabel}`))),
-				];
-
-				if (!profiles.length) {
-					lines.push(
-						boxed(theme.fg("muted", "No profiles exist yet.")),
-						boxed(""),
-					);
-				} else {
-					lines.push(boxed(""));
-					const maxVisible = 6;
-					const visibleCount = Math.min(maxVisible, profiles.length);
-					const start = Math.max(0, Math.min(selectedIndex - Math.floor(visibleCount / 2), profiles.length - visibleCount));
-					const end = start + visibleCount;
-					const gap = "  ";
-					const column = (content: string, columnWidth: number) => padAnsiEnd(truncateAnsi(content, columnWidth), columnWidth);
-					const row = (columns: Array<[string, number]>) => columns.map(([content, columnWidth]) => column(content, columnWidth)).join(gap);
-					const nameWidth = Math.min(24, Math.max("Profile".length, ...profiles.map((entry) => entry.profile.length + 2)));
-					const statusWidth = Math.max(1, innerWidth - nameWidth - gap.length);
-
-					lines.push(boxed(row([
-						[theme.fg("dim", "Profile"), nameWidth],
-						[theme.fg("dim", "Status"), statusWidth],
-					])));
-					if (start > 0) lines.push(boxed(theme.fg("dim", `… ${start} earlier`)));
-					for (let index = start; index < end; index += 1) {
-						const entry = profiles[index]!;
-						const isSelected = index === selectedIndex;
-						const marker = isSelected ? theme.fg("accent", "›") : " ";
-						const dot = theme.fg(profileStatusColor(entry), entry.inUse ? "●" : "○");
-						const name = theme.fg(isSelected ? "accent" : "text", entry.profile);
-						const status = theme.fg(profileStatusColor(entry), profileStatusLabel(entry, ctx.cwd));
-						const renderedRow = row([
-							[`${marker} ${name}`, nameWidth],
-							[`${dot} ${status}`, statusWidth],
-						]);
-						lines.push(isSelected ? selectedLine(renderedRow) : boxed(renderedRow));
-					}
-					if (end < profiles.length) lines.push(boxed(theme.fg("dim", `… ${profiles.length - end} more`)));
-				}
-
-				const openLabel = selected?.inUse ? "connect" : "open";
-				const controls: string[] = deleteInProgress
-					? [theme.fg("warning", "Deleting profile…")]
-					: !profiles.length
-						? [
-							`${workflowKeycap(theme, "N", "accent")} new profile`,
-							`${workflowKeycap(theme, "Esc")} back`,
-						]
-						: deleteArmed
-							? [
-								`${workflowKeycap(theme, "D", "warning")} confirm delete`,
-								`${workflowKeycap(theme, "Esc")} cancel`,
-							]
-							: [
-								`${workflowKeycap(theme, "↑↓")} move`,
-								`${workflowKeycap(theme, "Enter", "accent")} ${openLabel}`,
-								`${workflowKeycap(theme, "N", "accent")} new`,
-								`${workflowKeycap(theme, "R", "accent")} rename`,
-								`${workflowKeycap(theme, "D", "accent")} delete`,
-								`${workflowKeycap(theme, "Esc")} back`,
-							];
-
-				// A running profile cannot be deleted: removing a live user data dir breaks the browser
-				// holding it, which may belong to a Pi session in another project. Renaming is safe —
-				// the name lives in a sidecar, so nothing on disk moves.
-				const hint = deleteArmed && selected
-					? theme.fg("warning", `Delete '${selected.profile}'? Signed-in sessions in it are lost.`)
-					: selected?.inUse
-						? theme.fg("dim", "Running profiles cannot be deleted. Enter connects to the browser.")
-						: "";
-				lines.push(boxed(""));
-				if (profiles.length) lines.push(boxed(hint));
-				lines.push(
-					...controlLines(theme, controls, innerWidth).map((line) => boxed(line)),
-					border("╰", "─", "╯"),
-				);
-				return clamp(lines);
+				return profilePickerLines(theme, width, { browserLabel, profiles, selectedIndex, deleteArmed, busy, cwd: ctx.cwd });
 			},
 			invalidate(): void {},
 			handleInput(data: string): void {
 				const selected = profiles[selectedIndex];
 				const selectKey = matchSelectKey(data, keybindings);
-				if (deleteInProgress) return;
+				if (busy) return;
 				if (matchesShortcut(data, "n")) {
 					done({ type: "new" });
 					return;
@@ -318,33 +465,46 @@ async function chooseProfile(
 	browserKey: string,
 	browserLabel: string,
 ): Promise<string | undefined> {
+	// Kept across iterations so re-entering the picker draws the list it had rather than an empty
+	// frame, while the refresh it runs on mount catches anything that changed meanwhile.
+	let entries: ProfileListEntry[] = [];
 	const listProfiles = async (): Promise<ProfileListEntry[]> => {
 		try {
 			const listed = await manager.execute({ action: "list_profiles", browserKey });
-			return (listed.details.profiles as ProfileListEntry[] | undefined) ?? [];
+			entries = (listed.details.profiles as ProfileListEntry[] | undefined) ?? [];
 		} catch {
-			// Discovery is a convenience; fall back to naming a profile outright.
-			return [];
+			// Discovery is a convenience; naming a profile outright still works without it.
 		}
+		return entries;
 	};
 
+	let pending: PendingScreenWork | undefined;
 	while (true) {
-		const entries = await listProfiles();
-		const action = await showProfilePickerScreen(ctx, browserLabel, entries, async (profile) => {
-			const deleted = await manager.execute({ action: "delete_profile", browserKey, profile: profile.profile });
-			ctx.ui.notify(deleted.text, "info");
-			return listProfiles();
-		});
+		const action = await showProfilePickerScreen(
+			ctx,
+			browserLabel,
+			entries,
+			listProfiles,
+			async (profile) => {
+				const deleted = await manager.execute({ action: "delete_profile", browserKey, profile: profile.profile });
+				ctx.ui.notify(deleted.text, "info");
+			},
+			pending,
+		);
+		pending = undefined;
 
 		if (action.type === "cancel") return undefined;
 		if (action.type === "open") return action.profile.profile;
 
+		// Both branches fall straight into the name screen with nothing awaited in between, so the
+		// renderer coalesces the swap and the editor is never painted between the two frames.
 		const takenNames = entries.map((entry) => entry.profile);
 		if (action.type === "new") {
-			const name = await showProfileNameScreen(ctx, {
-				title: "New Profile",
+			const name = await showNameEntryScreen(ctx, {
+				title: `New Profile — ${browserLabel}`,
 				confirmLabel: "create",
-				browserLabel,
+				subject: "profile",
+				context: `${browserLabel} profile.`,
 				initial: suggestProfileName(takenNames),
 				taken: takenNames,
 			});
@@ -352,25 +512,27 @@ async function chooseProfile(
 			continue;
 		}
 
-		const renamed = await showProfileNameScreen(ctx, {
-			title: "Rename Profile",
+		const renamed = await showNameEntryScreen(ctx, {
+			title: `Rename Profile — ${browserLabel}`,
 			confirmLabel: "rename",
-			browserLabel,
+			subject: "profile",
+			context: `${browserLabel} profile.`,
 			initial: action.profile.profile,
 			taken: takenNames,
 		});
 		if (!renamed || renamed === action.profile.profile) continue;
-		try {
-			const result = await manager.execute({
-				action: "rename_profile",
-				browserKey,
-				profile: action.profile.profile,
-				targetProfile: renamed,
-			});
-			ctx.ui.notify(result.text, "info");
-		} catch (error) {
-			ctx.ui.notify((error as Error).message, "error");
-		}
+		pending = {
+			message: "Renaming profile…",
+			run: async () => {
+				const result = await manager.execute({
+					action: "rename_profile",
+					browserKey,
+					profile: action.profile.profile,
+					targetProfile: renamed,
+				});
+				ctx.ui.notify(result.text, "info");
+			},
+		};
 	}
 }
 
@@ -414,26 +576,66 @@ export function printableInput(data: string): string | undefined {
 	return data;
 }
 
+export interface NameEntryOptions {
+	/** The whole heading, e.g. `New Profile — Microsoft Edge`. */
+	title: string;
+	confirmLabel: string;
+	/** The noun in "Enter a profile name." and "A profile named 'x' already exists." */
+	subject: string;
+	/** What the name will belong to, shown once it is usable, e.g. `Microsoft Edge profile.` */
+	context: string;
+	initial: string;
+	taken: string[];
+	/**
+	 * Names only a manager call knows about.
+	 *
+	 * Loaded against the mounted field rather than before it: awaiting between two screens hands the
+	 * terminal back to the editor, which reads as the frame vanishing and returning.
+	 */
+	loadTaken?: () => Promise<string[]>;
+	/** A starting name to fill in once `loadTaken` lands, if nothing has been typed by then. */
+	suggest?: (taken: string[]) => string;
+}
+
 /**
- * Text entry for a profile name, rendered in the Browser Manager's frame.
+ * Text entry for a name, rendered in the Browser Manager's frame.
  *
  * Names are kept exactly as typed, so the field only has to refuse an empty name or one already taken,
- * rather than letting the manager reject it afterwards.
+ * rather than letting the manager reject it afterwards. Shared by profiles and browsers so that
+ * naming anything looks the same; before this, renaming a browser dropped out to a plain prompt.
  */
-async function showProfileNameScreen(
+async function showNameEntryScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
-	options: { title: string; confirmLabel: string; browserLabel: string; initial: string; taken: string[] },
+	options: NameEntryOptions,
 ): Promise<string | undefined> {
 	let value = options.initial;
 	let cursor = value.length;
+	let taken = options.taken;
+	let touched = false;
 	let requestRender: (() => void) | undefined;
 	let component: RecordingScreenComponent | undefined;
 
 	return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
 		requestRender = () => tui.requestRender();
+		if (options.loadTaken) {
+			void options.loadTaken()
+				.then((loaded) => {
+					taken = loaded;
+					// Only move the field the user has not touched yet; typing always wins.
+					if (!touched && options.suggest) {
+						value = options.suggest(loaded);
+						cursor = value.length;
+					}
+				})
+				.catch(() => {
+					// Discovery is a convenience. Without it the manager refuses a duplicate afterwards.
+				})
+				.finally(() => requestRender?.());
+		}
 		component = {
 			render(width: number): string[] {
-				const { innerWidth, bold, border, boxed, clamp } = screenFrame(theme, width);
+				const frame = screenFrame(theme, width);
+				const { innerWidth, bold, border, boxed, clamp } = frame;
 
 				const label = "Name  ";
 				const fieldWidth = Math.max(8, innerWidth - label.length);
@@ -447,12 +649,12 @@ async function showProfileNameScreen(
 				const cursorCell = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", atCursor) : theme.fg("accent", atCursor);
 				const field = `${theme.fg("dim", label)}${theme.fg("text", before)}${cursorCell}${theme.fg("text", after)}`;
 
-				const { name, collides, canConfirm } = profileNameState(value, options.initial, options.taken);
+				const { name, collides, canConfirm } = profileNameState(value, options.initial, taken);
 				const status = !name
-					? theme.fg("dim", "Enter a profile name.")
+					? theme.fg("dim", `Enter a ${options.subject} name.`)
 					: collides
-						? theme.fg("error", `A profile named '${name}' already exists.`)
-						: theme.fg("dim", `${options.browserLabel} profile.`);
+						? theme.fg("error", `A ${options.subject} named '${name}' already exists.`)
+						: theme.fg("dim", options.context);
 
 				const controls: string[] = [
 					canConfirm
@@ -463,12 +665,12 @@ async function showProfileNameScreen(
 
 				return clamp([
 					border("╭", "─", "╮"),
-					boxed(theme.fg("text", bold(`${options.title} — ${options.browserLabel}`))),
+					boxed(theme.fg("text", bold(options.title))),
 					boxed(""),
 					boxed(field),
 					boxed(""),
 					boxed(status),
-					...controlLines(theme, controls, innerWidth).map((line) => boxed(line)),
+					...controlBlock(theme, frame, [controls], 0),
 					border("╰", "─", "╯"),
 				]);
 			},
@@ -477,6 +679,7 @@ async function showProfileNameScreen(
 				// Typing wins over every binding: a select keybinding on a letter must not eat input.
 				const typed = printableInput(data);
 				if (typed) {
+					touched = true;
 					value = value.slice(0, cursor) + typed + value.slice(cursor);
 					cursor += typed.length;
 					requestRender?.();
@@ -485,6 +688,7 @@ async function showProfileNameScreen(
 
 				if (data === "\x7f" || data === "\b") {
 					if (cursor > 0) {
+						touched = true;
 						value = value.slice(0, cursor - 1) + value.slice(cursor);
 						cursor -= 1;
 						requestRender?.();
@@ -493,12 +697,14 @@ async function showProfileNameScreen(
 				}
 				if (data === "\x1b[3~") {
 					if (cursor < value.length) {
+						touched = true;
 						value = value.slice(0, cursor) + value.slice(cursor + 1);
 						requestRender?.();
 					}
 					return;
 				}
 				if (data === "\x15") {
+					touched = true;
 					value = value.slice(cursor);
 					cursor = 0;
 					requestRender?.();
@@ -531,7 +737,7 @@ async function showProfileNameScreen(
 					return;
 				}
 				if (selectKey === "confirm") {
-					const { name, canConfirm } = profileNameState(value, options.initial, options.taken);
+					const { name, canConfirm } = profileNameState(value, options.initial, taken);
 					if (canConfirm) done(name);
 				}
 			},
@@ -576,15 +782,18 @@ type WorkflowLibraryAction =
 	| { type: "export"; workflow: SavedWorkflowSummary }
 	| { type: "delete"; workflow: SavedWorkflowSummary };
 
+/**
+ * What the Browser Manager cannot finish on its own.
+ *
+ * Opening, showing, closing, renaming and saving all run against the mounted screen instead — see
+ * `InFrameAction`. What is left is the cases that genuinely need a different screen first.
+ */
 type SessionManagerAction =
 	| { type: "exit" }
-	| { type: "create" }
 	| { type: "create-with-profile" }
 	| { type: "save"; session: SessionSummary }
 	| { type: "change-default-browser" }
-	| { type: "show"; session: SessionSummary }
-	| { type: "rename"; session: SessionSummary }
-	| { type: "close"; session: SessionSummary };
+	| { type: "rename"; session: SessionSummary };
 
 const WORKFLOW_RECORDING_WIDGET_KEY = "pi-puppeteer-workflow-recording";
 const WORKFLOW_RECORDING_STATUS_KEY = "pi-puppeteer-workflow";
@@ -658,16 +867,54 @@ function stripAnsi(value: string): string {
 	return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-function truncateAnsi(value: string, width: number): string {
+/** The numeric parameters of an SGR sequence, reading an omitted parameter as 0 the way terminals do. */
+function sgrParameters(sequence: string): number[] {
+	const body = sequence.slice(2, -1);
+	if (!body) return [0];
+	return body.split(";").map((parameter) => (parameter ? Number.parseInt(parameter, 10) : 0));
+}
+
+/**
+ * Truncate to a visible width, keeping the styling that survives the cut and closing what it opened.
+ *
+ * Cutting mid-run drops that run's reset, and the colour then bleeds through the padding `padAnsiEnd`
+ * adds and on into the next column. Only the attributes actually left open are closed: a blanket
+ * `\x1b[0m` would also cancel the row highlight `selectedLine` paints around the finished line.
+ */
+export function truncateAnsi(value: string, width: number): string {
 	if (width <= 0) return "";
 	if (stripAnsi(value).length <= width) return value;
 	let visible = 0;
 	let output = "";
+	let foreground = false;
+	let background = false;
+	let bold = false;
 	for (let index = 0; index < value.length;) {
 		if (value[index] === "\x1b") {
 			const match = value.slice(index).match(/^\x1B\[[0-?]*[ -/]*[@-~]/);
 			if (match) {
 				output += match[0];
+				if (match[0].endsWith("m")) {
+					const parameters = sgrParameters(match[0]);
+					for (let position = 0; position < parameters.length; position += 1) {
+						const parameter = parameters[position]!;
+						if (parameter === 38 || parameter === 48) {
+							if (parameter === 38) foreground = true;
+							else background = true;
+							// `5;n` picks a 256-colour index and `2;r;g;b` a truecolor triple. Step over the
+							// operands so a colour component is never read back as an attribute of its own.
+							position += parameters[position + 1] === 2 ? 4 : parameters[position + 1] === 5 ? 2 : 1;
+							continue;
+						}
+						if (parameter === 0) foreground = background = bold = false;
+						else if (parameter === 1) bold = true;
+						else if (parameter === 22) bold = false;
+						else if (parameter === 39) foreground = false;
+						else if (parameter === 49) background = false;
+						else if ((parameter >= 30 && parameter <= 37) || (parameter >= 90 && parameter <= 97)) foreground = true;
+						else if ((parameter >= 40 && parameter <= 47) || (parameter >= 100 && parameter <= 107)) background = true;
+					}
+				}
 				index += match[0].length;
 				continue;
 			}
@@ -677,7 +924,8 @@ function truncateAnsi(value: string, width: number): string {
 		visible += 1;
 		index += 1;
 	}
-	return `${output}…`;
+	const reset = `${bold ? "\x1b[22m" : ""}${foreground ? "\x1b[39m" : ""}${background ? "\x1b[49m" : ""}`;
+	return `${output}…${reset}`;
 }
 
 function padAnsiEnd(value: string, width: number): string {
@@ -739,6 +987,7 @@ interface ScreenTheme {
 export interface ScreenFrame {
 	innerWidth: number;
 	bold(text: string): string;
+	dim(text: string): string;
 	border(left: string, fill: string, right: string): string;
 	boxed(content?: string): string;
 	selectedLine(content: string): string;
@@ -760,6 +1009,7 @@ export function screenFrame(theme: ScreenTheme, width: number): ScreenFrame {
 	return {
 		innerWidth,
 		bold: (text) => (typeof theme.bold === "function" ? theme.bold(text) : text),
+		dim: (text) => theme.fg("dim", text),
 		border: (left, fill, right) => theme.fg("borderMuted", `${left}${fill.repeat(Math.max(0, minWidth - 2))}${right}`),
 		boxed: (content = "") => `${theme.fg("borderMuted", "│ ")}${fit(content)}${theme.fg("borderMuted", " │")}`,
 		selectedLine: (content) => {
@@ -804,6 +1054,58 @@ export function controlLines(theme: ScreenTheme, hints: string[], innerWidth: nu
 	if (current.length) lines.push(current.join(separator));
 	// A hint wider than the frame still has to produce a line; the frame truncates it.
 	return lines.length ? lines : [""];
+}
+
+/**
+ * The control hints, at a height that does not depend on which set is showing.
+ *
+ * Arming a confirm swaps the hints for a shorter, differently worded set, and at some widths that
+ * changes how many lines `controlLines` wraps to — which moves the bottom border while the user is
+ * mid-decision. Padding every set out to the widest one holds the frame still. Matching the label
+ * lengths by hand would not: `close` and `confirm close` are legitimately different words.
+ */
+export function controlBlock(theme: ScreenTheme, frame: ScreenFrame, hintSets: string[][], active: number): string[] {
+	const height = Math.max(...hintSets.map((hints) => controlLines(theme, hints, frame.innerWidth).length));
+	const lines = controlLines(theme, hintSets[active] ?? [], frame.innerWidth).map((line) => frame.boxed(line));
+	while (lines.length < height) lines.push(frame.boxed(""));
+	return lines;
+}
+
+/** Lay cells out in fixed-width columns, each padded and truncated to fit its own column. */
+export function tableRow(cells: Array<[content: string, width: number]>, gap = "  "): string {
+	return cells.map(([content, width]) => padAnsiEnd(truncateAnsi(content, width), width)).join(gap);
+}
+
+export interface ListRowsSpec<T> {
+	items: T[];
+	selectedIndex: number;
+	maxVisible: number;
+	/** A row's content, before the frame adds its border and selection highlight. */
+	row(item: T, isSelected: boolean, index: number): string;
+}
+
+/**
+ * The scrolling row block both list screens draw, at a height that depends only on the list length.
+ *
+ * Both overflow markers are always drawn, blank when there is nothing above or below. They used to be
+ * pushed only when they had something to say, so arrowing through a list changed the screen's height —
+ * and because these screens are inline rather than overlays, a height change repaints everything from
+ * that line to the bottom of the terminal. The whole box appeared to twitch on every keypress.
+ */
+export function listRows<T>(frame: ScreenFrame, spec: ListRowsSpec<T>): string[] {
+	const { items, selectedIndex, maxVisible, row } = spec;
+	const visibleCount = Math.min(maxVisible, items.length);
+	const start = Math.max(0, Math.min(selectedIndex - Math.floor(visibleCount / 2), items.length - visibleCount));
+	const end = start + visibleCount;
+
+	const lines = [frame.boxed(start > 0 ? frame.dim(`… ${start} earlier`) : "")];
+	for (let index = start; index < end; index += 1) {
+		const isSelected = index === selectedIndex;
+		const rendered = row(items[index]!, isSelected, index);
+		lines.push(isSelected ? frame.selectedLine(rendered) : frame.boxed(rendered));
+	}
+	lines.push(frame.boxed(end < items.length ? frame.dim(`… ${items.length - end} more`) : ""));
+	return lines;
 }
 
 type SelectKeyAction = "up" | "down" | "confirm" | "cancel";
@@ -1208,167 +1510,207 @@ function sessionProfileLabel(session: SessionSummary): string {
 	return session.profile ?? "—";
 }
 
+/** How many session rows the manager shows before it starts scrolling. */
+const SESSIONS_VISIBLE = 6;
+
+export interface BrowserManagerState {
+	sessions: SessionSummary[];
+	selectedIndex: number;
+	closeArmed: boolean;
+	/** What is running right now. Shown in the reserved notice row, with the controls dimmed. */
+	busy?: string;
+}
+
+/**
+ * The Browser Manager's lines, at a height that depends only on the session count and the width.
+ *
+ * Pulled out of the component so `scripts/verify.ts` can assert that: the screen is inline rather
+ * than an overlay, so every line the height changes by repaints the box, the editor, and the footer
+ * beneath it. Selection, an armed confirm, and an operation in flight must all leave it alone.
+ */
+export function browserManagerLines(theme: ScreenTheme, width: number, state: BrowserManagerState): string[] {
+	const { sessions, selectedIndex, closeArmed, busy } = state;
+	const frame = screenFrame(theme, width);
+	const { innerWidth, bold, dim, border, boxed, clamp } = frame;
+	const selected = sessions[selectedIndex];
+	const lines = [
+		border("╭", "─", "╮"),
+		boxed(theme.fg("text", bold("Browser Manager"))),
+	];
+
+	if (!sessions.length) {
+		lines.push(
+			boxed(theme.fg("muted", "No browser sessions are open.")),
+			boxed(""),
+		);
+	} else {
+		lines.push(boxed(""));
+		const gap = "  ";
+		const nameWidth = Math.min(24, Math.max("Name".length, ...sessions.map((session) => session.name.length + 2)));
+		const minBrowserWidth = 10;
+		const minProfileWidth = 9;
+		const naturalBrowserWidth = Math.min(28, Math.max("Browser".length, ...sessions.map((session) => session.displayName.length)));
+		const naturalProfileWidth = Math.min(20, Math.max("Profile".length, ...sessions.map((session) => sessionProfileLabel(session).length)));
+		const fullTableFixedWidth = nameWidth + gap.length;
+		const useFullTable = fullTableFixedWidth + minBrowserWidth <= innerWidth;
+		// The profile column is the first thing to go on a narrow terminal: which browser a
+		// session is driving matters more than whether its profile is being kept.
+		const withProfile = useFullTable && fullTableFixedWidth + minBrowserWidth + gap.length + minProfileWidth <= innerWidth;
+		const profileWidth = withProfile
+			? Math.min(naturalProfileWidth, innerWidth - fullTableFixedWidth - minBrowserWidth - gap.length)
+			: 0;
+		const browserWidth = useFullTable
+			? Math.min(
+				naturalBrowserWidth,
+				Math.max(minBrowserWidth, innerWidth - fullTableFixedWidth - (withProfile ? profileWidth + gap.length : 0)),
+			)
+			: 0;
+		const compactDetailsWidth = Math.max(1, innerWidth - nameWidth - gap.length);
+		const detailsWidth = useFullTable ? browserWidth : compactDetailsWidth;
+
+		const header: Array<[string, number]> = [[dim("Name"), nameWidth], [dim("Browser"), detailsWidth]];
+		if (withProfile) header.push([dim("Profile"), profileWidth]);
+		lines.push(boxed(tableRow(header, gap)));
+
+		lines.push(...listRows(frame, {
+			items: sessions,
+			selectedIndex,
+			maxVisible: SESSIONS_VISIBLE,
+			row: (session, isSelected) => {
+				const marker = isSelected ? theme.fg("accent", "›") : " ";
+				const name = theme.fg(isSelected ? "accent" : "text", session.name);
+				const browser = theme.fg(isSelected ? "accent" : "text", session.displayName);
+				const columns: Array<[string, number]> = [[`${marker} ${name}`, nameWidth], [browser, detailsWidth]];
+				if (withProfile) {
+					const label = sessionProfileLabel(session);
+					columns.push([theme.fg(session.temporary ? "muted" : isSelected ? "accent" : "text", label), profileWidth]);
+				}
+				return tableRow(columns, gap);
+			},
+		}));
+	}
+
+	// Dimming a hint rather than dropping it keeps the block's wrap — and so the frame's height — the
+	// same as the cursor moves and while an action runs. The width is unchanged either way, since
+	// `controlLines` measures the visible text.
+	const hint = (key: string, label: string, options: { color?: "accent" | "warning" | "dim"; enabled?: boolean } = {}) => {
+		const enabled = (options.enabled ?? true) && !busy;
+		return `${workflowKeycap(theme, key, enabled ? options.color ?? "accent" : "dim")} ${enabled ? label : dim(label)}`;
+	};
+	// Every variant is handed to `controlBlock`, not just the live one. `close` and `detach` are
+	// different lengths, so which session the cursor is on decides where the row wraps — and the
+	// block can only pad to a height it has been shown.
+	const listHints = (stopLabel: string) => [
+		hint("↑↓", "move", { color: "dim" }),
+		hint("Enter", "show"),
+		hint("N", "new"),
+		hint("L", "load profile"),
+		// Always offered, so the row does not change shape as the cursor crosses between a
+		// throwaway session and a saved one. Dimmed where it would only explain itself.
+		hint("S", "save profile", { enabled: selected?.temporary === true }),
+		hint("R", "rename"),
+		hint("D", stopLabel),
+		hint("B", "change default browser"),
+		hint("Esc", "back", { color: "dim" }),
+	];
+	const armedHints = (confirmLabel: string) => [
+		hint("D", confirmLabel, { color: "warning" }),
+		hint("Esc", "cancel", { color: "dim" }),
+	];
+	const attached = selected?.mode === "attach";
+	const hintSets = sessions.length
+		? [listHints("close"), listHints("detach"), armedHints("confirm close"), armedHints("confirm detach")]
+		: [[
+			hint("N", "new"),
+			hint("L", "load profile"),
+			hint("B", "change default browser"),
+			hint("Esc", "back", { color: "dim" }),
+		]];
+	const activeHints = !sessions.length ? 0 : closeArmed ? (attached ? 3 : 2) : (attached ? 1 : 0);
+
+	// Closing is the one irreversible step in the throwaway flow, and it is already behind a
+	// two-press confirm, so naming what goes with it costs nothing and prevents a silent loss.
+	const notice = busy
+		? theme.fg("warning", busy)
+		: closeArmed && selected?.temporary
+			? theme.fg("warning", "Temporary — closing discards its signed-in sessions. Esc, then S to keep.")
+			: "";
+	lines.push(
+		boxed(""),
+		boxed(notice),
+		...controlBlock(theme, frame, hintSets, activeHints),
+		border("╰", "─", "╯"),
+	);
+	return clamp(lines);
+}
+
+/**
+ * Work the manager runs without leaving its frame.
+ *
+ * Resolving `ctx.ui.custom` hands the terminal back to the editor, so anything awaited between two
+ * screens is painted as the box vanishing and returning. Everything here therefore runs against the
+ * mounted screen instead, with its notice row saying what is happening.
+ */
+type InFrameAction =
+	| { type: "show"; session: SessionSummary }
+	| { type: "close"; session: SessionSummary }
+	| { type: "create"; profile?: string }
+	| { type: "rename"; session: SessionSummary; name: string }
+	| { type: "save"; session: SessionSummary; profile: string };
+
+interface PendingAction {
+	action: InFrameAction;
+	message: string;
+}
+
 async function showBrowserSessionsScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
-	sessions: SessionSummary[],
-	preferredSessionId?: string,
-	onCloseSession?: (session: SessionSummary) => Promise<SessionSummary[]>,
+	initialSessions: SessionSummary[],
+	preferredSessionId: string | undefined,
+	perform: (action: InFrameAction) => Promise<SessionSummary[]>,
+	pending?: PendingAction,
 ): Promise<SessionManagerAction> {
+	let sessions = initialSessions;
 	let selectedIndex = Math.max(0, sessions.findIndex((session) => session.id === preferredSessionId || (!preferredSessionId && session.current)));
 	let closeArmed = false;
-	let closeInProgress = false;
+	let busy: string | undefined;
 	let requestRender: (() => void) | undefined;
 	let component: RecordingScreenComponent | undefined;
 
 	return ctx.ui.custom<SessionManagerAction>((tui, theme, keybindings, done) => {
 		requestRender = () => tui.requestRender();
-		const closeSelectedSession = async (session: SessionSummary) => {
-			if (!onCloseSession || closeInProgress) return;
-			closeInProgress = true;
+		const runInFrame = async (action: InFrameAction, message: string) => {
+			if (busy) return;
+			busy = message;
+			closeArmed = false;
 			requestRender?.();
 			try {
-				sessions = await onCloseSession(session);
-				selectedIndex = sessions.length ? Math.min(selectedIndex, sessions.length - 1) : 0;
-				closeArmed = false;
+				sessions = await perform(action);
+				const current = sessions.findIndex((session) => session.current);
+				// Opening a browser should land on it; everything else keeps the cursor where it was.
+				selectedIndex = action.type === "create" && current >= 0
+					? current
+					: sessions.length ? Math.min(selectedIndex, sessions.length - 1) : 0;
 			} catch (error) {
-				closeArmed = false;
 				ctx.ui.notify((error as Error).message, "error");
 			} finally {
-				closeInProgress = false;
+				busy = undefined;
 				requestRender?.();
 			}
 		};
+		// Started here rather than before the mount so the box is already on screen while it runs.
+		if (pending) void runInFrame(pending.action, pending.message);
 		component = {
 			render(width: number): string[] {
-				const { innerWidth, bold, border, boxed, selectedLine, clamp } = screenFrame(theme, width);
-				const selected = sessions[selectedIndex];
-				const lines = [
-					border("╭", "─", "╮"),
-					boxed(theme.fg("text", bold("Browser Manager"))),
-				];
-
-				if (!sessions.length) {
-					lines.push(
-						boxed(theme.fg("muted", "No browser sessions are open.")),
-						boxed(""),
-					);
-				} else {
-					lines.push(boxed(""));
-					const maxVisible = 6;
-					const visibleCount = Math.min(maxVisible, sessions.length);
-					const start = Math.max(0, Math.min(selectedIndex - Math.floor(visibleCount / 2), sessions.length - visibleCount));
-					const end = start + visibleCount;
-					const gap = "  ";
-					const column = (content: string, columnWidth: number) => padAnsiEnd(truncateAnsi(content, columnWidth), columnWidth);
-					const row = (columns: Array<[string, number]>) => columns.map(([content, columnWidth]) => column(content, columnWidth)).join(gap);
-					const nameWidth = Math.min(24, Math.max("Name".length, ...sessions.map((session) => session.name.length + 2)));
-					const minBrowserWidth = 10;
-					const minProfileWidth = 9;
-					const naturalBrowserWidth = Math.min(28, Math.max("Browser".length, ...sessions.map((session) => session.displayName.length)));
-					const naturalProfileWidth = Math.min(20, Math.max("Profile".length, ...sessions.map((session) => sessionProfileLabel(session).length)));
-					const fullTableFixedWidth = nameWidth + gap.length;
-					const useFullTable = fullTableFixedWidth + minBrowserWidth <= innerWidth;
-					// The profile column is the first thing to go on a narrow terminal: which browser a
-					// session is driving matters more than whether its profile is being kept.
-					const withProfile = useFullTable && fullTableFixedWidth + minBrowserWidth + gap.length + minProfileWidth <= innerWidth;
-					const profileWidth = withProfile
-						? Math.min(naturalProfileWidth, innerWidth - fullTableFixedWidth - minBrowserWidth - gap.length)
-						: 0;
-					const browserWidth = useFullTable
-						? Math.min(
-							naturalBrowserWidth,
-							Math.max(minBrowserWidth, innerWidth - fullTableFixedWidth - (withProfile ? profileWidth + gap.length : 0)),
-						)
-						: 0;
-					const compactDetailsWidth = Math.max(1, innerWidth - nameWidth - gap.length);
-
-					if (withProfile) {
-						lines.push(boxed(row([
-							[theme.fg("dim", "Name"), nameWidth],
-							[theme.fg("dim", "Browser"), browserWidth],
-							[theme.fg("dim", "Profile"), profileWidth],
-						])));
-					} else if (useFullTable) {
-						lines.push(boxed(row([
-							[theme.fg("dim", "Name"), nameWidth],
-							[theme.fg("dim", "Browser"), browserWidth],
-						])));
-					} else {
-						lines.push(boxed(row([
-							[theme.fg("dim", "Name"), nameWidth],
-							[theme.fg("dim", "Browser"), compactDetailsWidth],
-						])));
-					}
-					if (start > 0) lines.push(boxed(theme.fg("dim", `… ${start} earlier`)));
-					for (let index = start; index < end; index += 1) {
-						const session = sessions[index]!;
-						const isSelected = index === selectedIndex;
-						const marker = isSelected ? theme.fg("accent", "›") : " ";
-						const name = theme.fg(isSelected ? "accent" : "text", session.name);
-						const browser = theme.fg(isSelected ? "accent" : "text", session.displayName);
-						const nameCell = `${marker} ${name}`;
-						const columns: Array<[string, number]> = [
-							[nameCell, nameWidth],
-							[browser, useFullTable ? browserWidth : compactDetailsWidth],
-						];
-						if (withProfile) {
-							const label = sessionProfileLabel(session);
-							columns.push([theme.fg(session.temporary ? "muted" : isSelected ? "accent" : "text", label), profileWidth]);
-						}
-						const renderedRow = row(columns);
-						lines.push(isSelected ? selectedLine(renderedRow) : boxed(renderedRow));
-					}
-					if (end < sessions.length) lines.push(boxed(theme.fg("dim", `… ${sessions.length - end} more`)));
-				}
-
-				const stopActionLabel = selected?.mode === "attach" ? "detach" : "close";
-				const confirmStopActionLabel = selected?.mode === "attach" ? "confirm detach" : "confirm close";
-				const controls: string[] = closeInProgress
-					? [theme.fg("warning", selected?.mode === "attach" ? "Detaching browser…" : "Closing browser…")]
-					: !sessions.length
-						? [
-							`${workflowKeycap(theme, "N", "accent")} new`,
-							`${workflowKeycap(theme, "L", "accent")} load profile`,
-							`${workflowKeycap(theme, "B", "accent")} change default browser`,
-							`${workflowKeycap(theme, "Esc")} back`,
-						]
-						: closeArmed
-							? [
-								`${workflowKeycap(theme, "D", "warning")} ${confirmStopActionLabel}`,
-								`${workflowKeycap(theme, "Esc")} cancel`,
-							]
-							: [
-								`${workflowKeycap(theme, "↑↓")} move`,
-								`${workflowKeycap(theme, "Enter", "accent")} show`,
-								`${workflowKeycap(theme, "N", "accent")} new`,
-								`${workflowKeycap(theme, "L", "accent")} load profile`,
-								// Offered only where it means something: a saved session is already kept.
-								...(selected?.temporary ? [`${workflowKeycap(theme, "S", "accent")} save profile`] : []),
-								`${workflowKeycap(theme, "R", "accent")} rename`,
-								`${workflowKeycap(theme, "D", "accent")} ${stopActionLabel}`,
-								`${workflowKeycap(theme, "B", "accent")} change default browser`,
-								`${workflowKeycap(theme, "Esc")} back`,
-							];
-				// Closing is the one irreversible step in the throwaway flow, and it is already behind a
-				// two-press confirm, so naming what goes with it costs nothing and prevents a silent loss.
-				const hint = closeArmed && selected?.temporary
-					? theme.fg("warning", "Temporary — closing discards its signed-in sessions. Esc, then S to keep.")
-					: "";
-				lines.push(boxed(""));
-				if (hint) lines.push(boxed(hint));
-				lines.push(
-					...controlLines(theme, controls, innerWidth).map((line) => boxed(line)),
-					border("╰", "─", "╯"),
-				);
-				return clamp(lines);
+				return browserManagerLines(theme, width, { sessions, selectedIndex, closeArmed, busy });
 			},
 			invalidate(): void {},
 			handleInput(data: string): void {
 				const selected = sessions[selectedIndex];
 				const selectKey = matchSelectKey(data, keybindings);
-				if (closeInProgress) return;
+				if (busy) return;
 				if (matchesShortcut(data, "n")) {
-					done({ type: "create" });
+					void runInFrame({ type: "create" }, "Opening browser…");
 					return;
 				}
 				if (matchesShortcut(data, "l")) {
@@ -1404,7 +1746,7 @@ async function showBrowserSessionsScreen(
 				}
 				if (!selected) return;
 				if (selectKey === "confirm") {
-					done({ type: "show", session: selected });
+					void runInFrame({ type: "show", session: selected }, "Showing browser…");
 					return;
 				}
 				if (matchesShortcut(data, "s")) {
@@ -1426,11 +1768,7 @@ async function showBrowserSessionsScreen(
 				}
 				if (matchesShortcut(data, "d")) {
 					if (closeArmed) {
-						if (onCloseSession) {
-							void closeSelectedSession(selected);
-						} else {
-							done({ type: "close", session: selected });
-						}
+						void runInFrame({ type: "close", session: selected }, selected.mode === "attach" ? "Detaching browser…" : "Closing browser…");
 						return;
 					}
 					closeArmed = true;
@@ -1450,96 +1788,130 @@ async function openBrowserSessionsManager(
 	browserManager: BrowserManager,
 	onChange?: () => Promise<void>,
 ): Promise<void> {
-	let selectedSessionId: string | undefined;
-	while (true) {
-		const config = loadConfig(ctx.cwd);
-		browserManager.setConfig(config);
-		const result = await browserManager.execute({ action: "sessions" });
-		const sessions = ((result.details.sessions as SessionSummary[] | undefined) ?? []);
-		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId, async (session) => {
-			const stopped = await browserManager.execute({ action: "stop", sessionId: session.id });
-			if (!stopped.details.alreadyClosed) {
-				ctx.ui.notify(stopped.text, "info");
-			}
-			await onChange?.();
-			const refreshed = await browserManager.execute({ action: "sessions" });
-			const nextSessions = ((refreshed.details.sessions as SessionSummary[] | undefined) ?? []);
-			selectedSessionId = nextSessions.find((candidate) => candidate.current)?.id ?? nextSessions[0]?.id;
-			return nextSessions;
-		});
-		if (action.type === "exit") return;
-		if ("session" in action) selectedSessionId = action.session.id;
-		try {
-			if (action.type === "change-default-browser") {
-				const selectedKey = await chooseDefaultBrowser(ctx, config);
-				if (!selectedKey) continue;
-				await writeProjectDefaultBrowser(ctx.cwd, config, selectedKey);
-				const nextConfig = loadConfig(ctx.cwd);
-				browserManager.setConfig(nextConfig);
-				const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
-				ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
-			} else if (action.type === "create" || action.type === "create-with-profile") {
-				// Opening a browser asks nothing by default. Persistence is a deliberate choice, so only
-				// the explicit "with profile" path shows the picker.
-				let chosenProfile: string | undefined;
-				if (action.type === "create-with-profile") {
-					const defaultBrowserLabel = config.browsers[config.defaultBrowser]?.displayName ?? config.defaultBrowser;
-					chosenProfile = await chooseProfile(ctx, browserManager, config.defaultBrowser, defaultBrowserLabel);
-					if (!chosenProfile) continue;
-				}
+	let config = loadConfig(ctx.cwd);
+	browserManager.setConfig(config);
 
-				const existingNames = new Set(sessions.map((session) => session.name.toLowerCase()));
-				let suggestedNumber = 1;
-				while (existingNames.has(`browser-${suggestedNumber}`)) suggestedNumber += 1;
-				const started = await browserManager.execute({
-					action: "start",
-					name: `Browser-${suggestedNumber}`,
-					profile: chosenProfile,
-				});
-				const session = started.details.session as SessionSummary | undefined;
-				selectedSessionId = session?.id;
-				ctx.ui.notify(started.text, "info");
-			} else if (action.type === "save") {
-				const browserLabel = action.session.displayName;
-				const listed = await browserManager.execute({ action: "list_profiles", browserKey: action.session.browserKey });
-				const taken = ((listed.details.profiles as ProfileListEntry[] | undefined) ?? []).map((entry) => entry.profile);
-				const name = await showProfileNameScreen(ctx, {
-					title: "Save Profile",
-					confirmLabel: "save",
-					browserLabel,
-					initial: suggestProfileName(taken),
-					taken,
-				});
-				if (!name) continue;
-				const saved = await browserManager.execute({
-					action: "save_profile",
-					sessionId: action.session.id,
-					targetProfile: name,
-				});
-				ctx.ui.notify(saved.text, "info");
+	const listSessions = async (): Promise<SessionSummary[]> => {
+		const result = await browserManager.execute({ action: "sessions" });
+		return ((result.details.sessions as SessionSummary[] | undefined) ?? []);
+	};
+
+	/** A free `Browser-N`, so opening a browser lands on a name nothing else is using. */
+	const suggestSessionName = (existing: SessionSummary[]): string => {
+		const taken = new Set(existing.map((session) => session.name.toLowerCase()));
+		let suffix = 1;
+		while (taken.has(`browser-${suffix}`)) suffix += 1;
+		return `Browser-${suffix}`;
+	};
+
+	let sessions = await listSessions();
+	let selectedSessionId: string | undefined;
+	let pending: PendingAction | undefined;
+
+	/** Never rejects: the manager screen stays up, so a failure is a notification, not a torn frame. */
+	const perform = async (action: InFrameAction): Promise<SessionSummary[]> => {
+		try {
+			if (action.type === "close") {
+				const stopped = await browserManager.execute({ action: "stop", sessionId: action.session.id });
+				if (!stopped.details.alreadyClosed) ctx.ui.notify(stopped.text, "info");
 			} else if (action.type === "show") {
 				const shown = await browserManager.execute({ action: "show_session", sessionId: action.session.id });
 				ctx.ui.notify(shown.text, "info");
+			} else if (action.type === "create") {
+				const started = await browserManager.execute({
+					action: "start",
+					name: suggestSessionName(sessions),
+					profile: action.profile,
+				});
+				ctx.ui.notify(started.text, "info");
 			} else if (action.type === "rename") {
-				const enteredName = await ctx.ui.input("Rename browser:", action.session.name);
-				if (!enteredName) continue;
-				const trimmedName = enteredName.trim();
-				if (!trimmedName) {
-					ctx.ui.notify("Browser name cannot be blank.", "error");
-					continue;
-				}
-				const renamed = await browserManager.execute({ action: "rename_session", sessionId: action.session.id, name: trimmedName });
-				const session = renamed.details.session as SessionSummary | undefined;
-				selectedSessionId = session?.id ?? action.session.id;
+				const renamed = await browserManager.execute({ action: "rename_session", sessionId: action.session.id, name: action.name });
 				ctx.ui.notify(renamed.text, "info");
-			} else if (action.type === "close") {
-				const stopped = await browserManager.execute({ action: "stop", sessionId: action.session.id });
-				ctx.ui.notify(stopped.text, "info");
+			} else {
+				const saved = await browserManager.execute({
+					action: "save_profile",
+					sessionId: action.session.id,
+					targetProfile: action.profile,
+				});
+				ctx.ui.notify(saved.text, "info");
 			}
 		} catch (error) {
 			ctx.ui.notify((error as Error).message, "error");
 		}
 		await onChange?.();
+		sessions = await listSessions();
+		if (action.type === "create") selectedSessionId = sessions.find((candidate) => candidate.current)?.id ?? selectedSessionId;
+		return sessions;
+	};
+
+	while (true) {
+		const action = await showBrowserSessionsScreen(ctx, sessions, selectedSessionId, perform, pending);
+		pending = undefined;
+		if (action.type === "exit") return;
+		if ("session" in action) selectedSessionId = action.session.id;
+
+		// Every branch below either falls straight into the next screen with nothing awaited in
+		// between — so the renderer coalesces the two and the editor is never painted — or hands the
+		// manager a pending action to run once it is back on screen.
+		if (action.type === "change-default-browser") {
+			const selectedKey = await chooseDefaultBrowser(ctx, config);
+			if (!selectedKey) continue;
+			try {
+				await writeProjectDefaultBrowser(ctx.cwd, config, selectedKey);
+				config = loadConfig(ctx.cwd);
+				browserManager.setConfig(config);
+				const resolved = selectedKey === "system" ? ` (resolves to '${config.defaultBrowser}')` : "";
+				ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
+			} catch (error) {
+				ctx.ui.notify((error as Error).message, "error");
+			}
+			continue;
+		}
+
+		if (action.type === "create-with-profile") {
+			// Opening a browser asks nothing by default. Persistence is a deliberate choice, so only
+			// the explicit "with profile" path shows the picker.
+			const browserLabel = config.browsers[config.defaultBrowser]?.displayName ?? config.defaultBrowser;
+			const profile = await chooseProfile(ctx, browserManager, config.defaultBrowser, browserLabel);
+			if (!profile) continue;
+			pending = { action: { type: "create", profile }, message: "Opening browser…" };
+			continue;
+		}
+
+		if (action.type === "rename") {
+			const name = await showNameEntryScreen(ctx, {
+				title: `Rename Browser — ${action.session.displayName}`,
+				confirmLabel: "rename",
+				subject: "browser",
+				context: "Shown in the Browser Manager and in tool output.",
+				initial: action.session.name,
+				taken: sessions.filter((session) => session.id !== action.session.id).map((session) => session.name),
+			});
+			if (!name || name === action.session.name) continue;
+			pending = { action: { type: "rename", session: action.session, name }, message: "Renaming browser…" };
+			continue;
+		}
+
+		if (action.type === "save") {
+			const browserKey = action.session.browserKey;
+			const profile = await showNameEntryScreen(ctx, {
+				title: `Save Profile — ${action.session.displayName}`,
+				confirmLabel: "save",
+				subject: "profile",
+				context: `${action.session.displayName} profile.`,
+				initial: suggestProfileName([]),
+				taken: [],
+				// Which names are taken needs a manager call. Loading it against the mounted field
+				// keeps the flow from stalling on the editor first.
+				loadTaken: async () => {
+					const listed = await browserManager.execute({ action: "list_profiles", browserKey });
+					return ((listed.details.profiles as ProfileListEntry[] | undefined) ?? []).map((entry) => entry.profile);
+				},
+				suggest: suggestProfileName,
+			});
+			if (!profile) continue;
+			pending = { action: { type: "save", session: action.session, profile }, message: "Saving profile…" };
+		}
 	}
 }
 

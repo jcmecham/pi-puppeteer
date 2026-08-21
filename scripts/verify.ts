@@ -452,6 +452,182 @@ console.log("\nprofile name entry");
 	}
 }
 
+console.log("\nansi truncation");
+
+{
+	const { truncateAnsi } = await import("../src/index.ts");
+	const stripAnsi = (value: string) => value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+	const coloured = `\x1b[36ma-very-long-session-name\x1b[39m`;
+
+	// A cut mid-run used to drop the run's reset, and the colour then bled through the padding and on
+	// into the next column and the border.
+	const cut = truncateAnsi(coloured, 10);
+	check("a truncated colour is closed", cut.endsWith("\x1b[39m"), JSON.stringify(cut));
+	check("a truncated cell still measures its width", stripAnsi(cut).length === 10, `${stripAnsi(cut).length}`);
+	// `selectedLine` paints its highlight around the finished line, so a blanket reset inside the
+	// content would cancel the row highlight from the cut onwards.
+	check("truncation never emits a full reset", !cut.includes("\x1b[0m"), JSON.stringify(cut));
+
+	const bolded = truncateAnsi("\x1b[1m\x1b[38;5;42mbold and coloured\x1b[22m\x1b[39m", 8);
+	check("bold is closed too", bolded.includes("\x1b[22m") && bolded.includes("\x1b[39m"), JSON.stringify(bolded));
+	// `38;2;r;g;b` carries operands that look like attributes on their own; 49 as a blue value must
+	// not be read as "default background".
+	const truecolor = truncateAnsi("\x1b[38;2;100;49;22mtruecolor name\x1b[39m", 6);
+	check("truecolor operands are not read as attributes", truecolor.endsWith("\x1b[39m"), JSON.stringify(truecolor));
+	check("an unstyled cut stays unstyled", truncateAnsi("plain text here", 6) === "plain…", truncateAnsi("plain text here", 6));
+	check("a value that fits is returned whole", truncateAnsi(coloured, 80) === coloured);
+}
+
+console.log("\nscreen height is a function of the data, not the interaction");
+
+{
+	const { browserManagerLines, profilePickerLines, defaultBrowserLines } = await import("../src/index.ts");
+	// A real theme emits ANSI, which the padding helpers do not count; a zero-width stub isolates
+	// the geometry.
+	const theme = { fg: (_color: unknown, text: string) => text, bold: (text: string) => text, bg: (_color: unknown, text: string) => text };
+	const WIDTHS = [24, 40, 80, 120];
+
+	const session = (index: number, overrides: Record<string, unknown> = {}) => ({
+		id: `session-${index}`,
+		name: `Browser-${index}`,
+		browserKey: "chrome",
+		displayName: "Google Chrome",
+		engine: "chromium",
+		mode: "launch",
+		profile: "work",
+		current: index === 1,
+		tabCount: 1,
+		createdAt: 0,
+		lastActiveAt: 0,
+		tabs: [],
+		...overrides,
+	}) as any;
+
+	// Twelve rows so the window scrolls: both overflow markers, one of them, and neither.
+	const sessions = [
+		session(1, { temporary: true, profile: undefined }),
+		session(2, { mode: "attach", profile: undefined }),
+		...Array.from({ length: 10 }, (_, index) => session(index + 3)),
+	];
+
+	// The interaction states that must not move the frame. A long name forces truncation into the
+	// mix, since the column arithmetic runs differently once a cell overflows.
+	const named = sessions.map((entry, index) => (index === 4 ? { ...entry, name: "a-browser-with-a-very-long-name" } : entry));
+	for (const width of WIDTHS) {
+		const heights = new Set<number>();
+		for (const list of [sessions, named]) {
+			for (let selectedIndex = 0; selectedIndex < list.length; selectedIndex += 1) {
+				for (const closeArmed of [false, true]) {
+					for (const busy of [undefined, "Closing browser…", "Opening browser…"]) {
+						heights.add(browserManagerLines(theme, width, { sessions: list, selectedIndex, closeArmed, busy }).length);
+					}
+				}
+			}
+		}
+		check(`the manager keeps one height at ${width} columns`, heights.size === 1, [...heights].join("/"));
+
+		const lines = browserManagerLines(theme, width, { sessions, selectedIndex: 3, closeArmed: true });
+		const widths = [...new Set(lines.map((line) => [...line].length))];
+		check(`the manager renders at exactly ${width} columns`, widths.length === 1 && widths[0] === width, widths.join("/"));
+		// The window plus both overflow markers, the title, the blank, the header, the notice, and
+		// the borders. Named so a change to the layout has to be deliberate.
+		check(`the manager is 6 rows of sessions at ${width}`, lines.length >= 6 + 2, `${lines.length}`);
+	}
+
+	// One session on its own: a shorter list is a real data change, but it still must not depend on
+	// the interaction either.
+	for (const width of WIDTHS) {
+		for (const list of [[sessions[0]!], [], sessions.slice(0, 3)]) {
+			const heights = new Set<number>();
+			for (let selectedIndex = 0; selectedIndex < Math.max(1, list.length); selectedIndex += 1) {
+				for (const closeArmed of [false, true]) {
+					for (const busy of [undefined, "Closing browser…"]) {
+						heights.add(browserManagerLines(theme, width, { sessions: list, selectedIndex, closeArmed, busy }).length);
+					}
+				}
+			}
+			check(`a ${list.length}-session manager keeps one height at ${width}`, heights.size === 1, [...heights].join("/"));
+		}
+	}
+
+	const profile = (index: number, overrides: Record<string, unknown> = {}) => ({
+		browserKey: "chrome",
+		displayName: "Google Chrome",
+		profile: `profile-${index}`,
+		inUse: false,
+		state: "free",
+		sessionId: null,
+		ownerCwd: null,
+		lastUsedAt: null,
+		...overrides,
+	}) as any;
+
+	const profiles = [
+		profile(1, { inUse: true, state: "live", sessionId: "session-1" }),
+		profile(2, { inUse: true, state: "starting" }),
+		...Array.from({ length: 10 }, (_, index) => profile(index + 3)),
+	];
+
+	for (const width of WIDTHS) {
+		const heights = new Set<number>();
+		for (let selectedIndex = 0; selectedIndex < profiles.length; selectedIndex += 1) {
+			for (const deleteArmed of [false, true]) {
+				for (const busy of [undefined, "Deleting profile…", "Looking for profiles…"]) {
+					heights.add(profilePickerLines(theme, width, {
+						browserLabel: "Google Chrome",
+						profiles,
+						selectedIndex,
+						deleteArmed,
+						busy,
+						cwd: ROOT,
+					}).length);
+				}
+			}
+		}
+		check(`the picker keeps one height at ${width} columns`, heights.size === 1, [...heights].join("/"));
+
+		const lines = profilePickerLines(theme, width, {
+			browserLabel: "Google Chrome",
+			profiles,
+			selectedIndex: 0,
+			deleteArmed: true,
+			cwd: ROOT,
+		});
+		const widths = [...new Set(lines.map((line) => [...line].length))];
+		check(`the picker renders at exactly ${width} columns`, widths.length === 1 && widths[0] === width, widths.join("/"));
+	}
+
+	// The two screens share a structure, not a line count: an empty manager offers four controls where
+	// an empty picker offers two, so they legitimately wrap differently on a narrow terminal. What has
+	// to match is that both reserve a notice row rather than pushing one only when it has something to
+	// say — the drift that made the manager grow a line when a close was armed.
+	for (const width of WIDTHS) {
+		const quiet = profilePickerLines(theme, width, { browserLabel: "Google Chrome", profiles, selectedIndex: 2, deleteArmed: false, cwd: ROOT });
+		const noisy = profilePickerLines(theme, width, { browserLabel: "Google Chrome", profiles, selectedIndex: 0, deleteArmed: true, cwd: ROOT });
+		check(`the picker reserves its notice row at ${width}`, quiet.length === noisy.length, `${quiet.length}/${noisy.length}`);
+
+		const unarmed = browserManagerLines(theme, width, { sessions, selectedIndex: 0, closeArmed: false });
+		const armed = browserManagerLines(theme, width, { sessions, selectedIndex: 0, closeArmed: true });
+		check(`the manager reserves its notice row at ${width}`, unarmed.length === armed.length, `${unarmed.length}/${armed.length}`);
+	}
+
+	const browsers = [
+		{ key: "system", label: "System [chrome] — OS default" },
+		{ key: "chrome", label: "Google Chrome" },
+		{ key: "edge", label: "Microsoft Edge" },
+	];
+	for (const width of WIDTHS) {
+		const heights = new Set<number>();
+		for (let selectedIndex = 0; selectedIndex < browsers.length; selectedIndex += 1) {
+			const lines = defaultBrowserLines(theme, width, { options: browsers, selectedIndex });
+			heights.add(lines.length);
+			const widths = [...new Set(lines.map((line) => [...line].length))];
+			check(`the browser picker renders row ${selectedIndex} at exactly ${width} columns`, widths.length === 1 && widths[0] === width, widths.join("/"));
+		}
+		check(`the browser picker keeps one height at ${width} columns`, heights.size === 1, [...heights].join("/"));
+	}
+}
+
 rmSync(ROOT, { recursive: true, force: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
