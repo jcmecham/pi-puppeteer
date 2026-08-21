@@ -275,12 +275,19 @@ console.log("\nprofile lock detection");
 		"on POSIX an fcntl lock is undetectable, so unprovable still counts as in use",
 	);
 
-	// A lock symlink outlives a crash, so the pid it names is what decides. Pid 1 is never this
-	// process and is not a browser; the current pid stands in for a live one.
+	// A lock symlink outlives a crash, so the pid it names is what decides. A genuinely dead pid has
+	// to be earned: pid 1 is alive and root-owned, and `kill(1, 0)` answers EPERM, which means "exists,
+	// not yours" rather than "gone". spawnSync returns only once the child has exited and been reaped,
+	// so its pid names a process that is really over. The current pid stands in for a live one.
 	if (process.platform !== "win32") {
 		const { symlinkSync } = await import("node:fs");
+		const { spawnSync } = await import("node:child_process");
+		const reaped = spawnSync(process.execPath, ["-e", ""]);
+		const deadPid = reaped.pid;
+		check("a throwaway child process could be reaped for its pid", typeof deadPid === "number" && deadPid > 0, String(reaped.error));
+
 		const dead = dir("chromium-crashed");
-		symlinkSync(`somehost-${1}`, join(dead, "SingletonLock"));
+		symlinkSync(`somehost-${deadPid}`, join(dead, "SingletonLock"));
 		check("a lock symlink naming a dead pid is not in use", !browserHoldsProfile(dead));
 
 		const live = dir("chromium-running");
