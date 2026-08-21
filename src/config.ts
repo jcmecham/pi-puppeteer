@@ -16,6 +16,7 @@ import {
 import os from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative as relativePath, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { browserHoldsProfile } from "./profile-lock.ts";
 import type {
 	BrowserDefinition,
 	BrowserEngine,
@@ -526,16 +527,6 @@ function listDirectories(root: string): string[] {
 	}
 }
 
-/**
- * A profile is in use when the browser holding it has not cleaned up its singleton markers. Moving it
- * would break the running browser, so migration defers to a later session instead.
- */
-function isProfileInUse(profileDir: string): boolean {
-	return ["SingletonLock", "SingletonCookie", "SingletonSocket", "lock", "parent.lock"].some((marker) =>
-		existsSync(join(profileDir, marker)),
-	);
-}
-
 function readMigrationMarker(markerPath: string): ProfileMigrationReport | undefined {
 	if (!existsSync(markerPath)) return undefined;
 	try {
@@ -624,7 +615,7 @@ function migrateProfilesToGlobal(cwd: string, globalProfileRoot: string): Profil
 				pending.push({ source, target, reason: "target-exists" });
 				continue;
 			}
-			if (isProfileInUse(source)) {
+			if (browserHoldsProfile(source)) {
 				pending.push({ source, target, reason: "locked" });
 				continue;
 			}

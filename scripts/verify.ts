@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 // Behavioural checks for storage layout, profile discovery and management, and screen geometry. The
@@ -94,14 +94,25 @@ console.log("\nmigration");
 }
 
 // A profile a browser still holds open must be deferred whole, never partially copied.
+//
+// The marker has to be genuinely unavailable, not merely present: a browser that exited leaves its
+// lock files behind, and treating those as proof of life is what used to wedge migration forever. On
+// Windows a read-only marker produces the same EPERM an exclusively held one does; on POSIX an fcntl
+// lock cannot be observed at all, so a bare marker already counts as held.
 {
 	const cwd = project("locked");
 	const dir = seedProfile(cwd, "edge", "work", "LOCKED");
-	writeFileSync(join(dir, "SingletonLock"), "", "utf8");
+	const marker = join(dir, "SingletonLock");
+	writeFileSync(marker, "", "utf8");
+	if (process.platform === "win32") chmodSync(marker, 0o444);
+
 	const config = loadConfig(cwd);
 	check("an in-use profile is deferred", config.profileMigration?.pending[0]?.reason === "locked", JSON.stringify(config.profileMigration));
 	check("the source is left intact", existsSync(join(dir, "Default", "Cookies")));
 	check("no partial copy reaches the global root", !existsSync(join(GLOBAL_PROFILES, "edge", "work")));
+
+	// Let the teardown at the bottom of this file remove it again.
+	if (process.platform === "win32") chmodSync(marker, 0o666);
 }
 
 {
@@ -142,7 +153,7 @@ console.log("\nconfiguration");
 
 console.log("\nprofile discovery");
 
-const { discoverProfiles } = await import("../src/profile-lock.ts");
+const { discoverProfiles } = await import("../src/profile-store.ts");
 
 {
 	const root = join(ROOT, "discovery");
@@ -199,8 +210,13 @@ console.log("\nprofile management");
 		}
 	}
 
-	await manager.execute({ action: "rename_profile", browserKey, profile: "idle", targetProfile: "renamed" });
-	check("rename moves the profile directory", existsSync(join(profileDir("renamed"), "marker")) && !existsSync(profileDir("idle")));
+	const renamed = await manager.execute({ action: "rename_profile", browserKey, profile: "idle", targetProfile: "renamed" });
+	// The whole point of the sidecar: a rename is a name change, not a directory move, so it stays safe
+	// while a browser holds the profile open.
+	check("rename leaves the directory exactly where it was", existsSync(join(profileDir("idle"), "marker")));
+	check("rename reports the original path", renamed.details.path === profileDir("idle"), String(renamed.details.path));
+	check("the renamed profile is found under its new name", (await discoverProfiles(GLOBAL_PROFILES, browserKey)).some((entry) => entry.profile === "renamed"));
+	check("the old name no longer resolves", !(await discoverProfiles(GLOBAL_PROFILES, browserKey)).some((entry) => entry.profile === "idle"));
 
 	await failsWith(
 		"rename refuses an existing target",
@@ -218,11 +234,11 @@ console.log("\nprofile management");
 		"new profile name is required",
 	);
 
-	// A traversal attempt is sanitized into a safe name rather than rejected; the containment assert
-	// in the manager is the backstop.
+	// A display name is stored verbatim, so a traversal in one is inert: it never reaches a path.
 	await manager.execute({ action: "rename_profile", browserKey, profile: "renamed", targetProfile: "../escaped" });
-	check("rename sanitizes a traversal into the profile root", existsSync(profileDir("escaped")));
-	check("rename writes nothing outside the profile root", !existsSync(join(GLOBAL_PROFILES, "..", "escaped")));
+	check("a traversal in a display name never becomes a directory", !existsSync(join(GLOBAL_PROFILES, "..", "escaped")) && !existsSync(profileDir("escaped")));
+	check("the profile still lives in its original directory", existsSync(join(profileDir("idle"), "marker")));
+	await manager.execute({ action: "rename_profile", browserKey, profile: "../escaped", targetProfile: "renamed" });
 
 	const deleted = await manager.execute({ action: "delete_profile", browserKey, profile: "taken" });
 	check("delete removes the profile directory", !existsSync(profileDir("taken")));
@@ -234,10 +250,137 @@ console.log("\nprofile management");
 	);
 }
 
+console.log("\nprofile lock detection");
+
+{
+	const { browserHoldsProfile } = await import("../src/profile-lock.ts");
+
+	const root = join(ROOT, "locks");
+	const dir = (name: string) => {
+		const path = join(root, name);
+		mkdirSync(path, { recursive: true });
+		return path;
+	};
+
+	check("a profile with no lock files is free", !browserHoldsProfile(dir("clean")));
+
+	// The regression this check exists for. Firefox creates parent.lock once and never removes it, so
+	// testing for the file alone reported every Firefox profile that had ever run as permanently in
+	// use — a migration that could never finish and a warning no user action could clear.
+	const stale = dir("firefox-exited");
+	writeFileSync(join(stale, "parent.lock"), "", "utf8");
+	check(
+		"a leftover parent.lock nobody holds is not in use",
+		process.platform === "win32" ? !browserHoldsProfile(stale) : browserHoldsProfile(stale),
+		"on POSIX an fcntl lock is undetectable, so unprovable still counts as in use",
+	);
+
+	// A lock symlink outlives a crash, so the pid it names is what decides. Pid 1 is never this
+	// process and is not a browser; the current pid stands in for a live one.
+	if (process.platform !== "win32") {
+		const { symlinkSync } = await import("node:fs");
+		const dead = dir("chromium-crashed");
+		symlinkSync(`somehost-${1}`, join(dead, "SingletonLock"));
+		check("a lock symlink naming a dead pid is not in use", !browserHoldsProfile(dead));
+
+		const live = dir("chromium-running");
+		symlinkSync(`somehost-${process.pid}`, join(live, "SingletonLock"));
+		check("a lock symlink naming a live pid is in use", browserHoldsProfile(live));
+
+		const firefoxLive = dir("firefox-running");
+		symlinkSync(`127.0.1.1:+${process.pid}`, join(firefoxLive, "lock"));
+		check("Firefox's ip:+pid lock target is understood", browserHoldsProfile(firefoxLive));
+
+		const unparseable = dir("unparseable");
+		symlinkSync("no-pid-here", join(unparseable, "SingletonLock"));
+		check("an unreadable lock target counts as in use on POSIX", browserHoldsProfile(unparseable));
+	}
+}
+
+console.log("\ntemporary profiles");
+
+{
+	const {
+		allocateSavedProfile,
+		allocateTemporaryProfile,
+		ensureProfileMeta,
+		nameProfile,
+		readProfileMeta,
+		resolveProfileByName,
+		sweepTemporaryProfiles,
+	} = await import("../src/profile-store.ts");
+
+	const root = join(ROOT, "temporary");
+
+	const first = allocateTemporaryProfile(root, "edge");
+	const second = allocateTemporaryProfile(root, "edge");
+	check("each throwaway launch gets its own directory", first.dir !== second.dir, `${first.dir} / ${second.dir}`);
+	check("a throwaway profile is flagged temporary", first.meta.temporary && second.meta.temporary);
+	check("a throwaway directory exists on disk", existsSync(first.dir));
+
+	// The claim the whole design rests on: saving is a name change in place, so a running browser is
+	// never asked to close, restart, or have its user data dir moved out from under it.
+	writeFileSync(join(first.dir, "Cookies"), "SESSION", "utf8");
+	const saved = nameProfile(first.dir, "edge", "My Work!");
+	check("saving clears the temporary flag", saved.temporary === false);
+	check("saving keeps the name verbatim", saved.name === "My Work!", saved.name);
+	check("saving does not move the directory", existsSync(join(first.dir, "Cookies")));
+	check("the saved flag is persisted", readProfileMeta(first.dir)?.temporary === false);
+
+	const found = resolveProfileByName(root, "edge", "my work!");
+	check("a saved profile resolves by name, case-insensitively", found?.dir === first.dir);
+	check("a throwaway profile does not resolve by name", resolveProfileByName(root, "edge", second.meta.name) === undefined);
+
+	const listed = await discoverProfiles(root, "edge");
+	check("discovery hides throwaway profiles", listed.length === 1 && listed[0]?.profile === "My Work!", JSON.stringify(listed.map((entry) => entry.profile)));
+	check("discovery can include them when asked", (await discoverProfiles(root, "edge", { includeTemporary: true })).length === 2);
+
+	// A directory from before the sidecar existed is named by its directory, so that name is adopted
+	// rather than the profile being mistaken for junk.
+	const legacyDir = join(root, "chrome", "work");
+	mkdirSync(legacyDir, { recursive: true });
+	writeFileSync(join(legacyDir, "Cookies"), "SESSION", "utf8");
+	const upgraded = ensureProfileMeta(legacyDir, "chrome");
+	check("a pre-sidecar directory keeps its name", upgraded.name === "work" && upgraded.id === "work");
+	check("a pre-sidecar directory is not treated as temporary", !upgraded.temporary);
+
+	// The tmp- prefix is cosmetic. Inferring from it would let the sweep delete a profile someone had
+	// named "tmp-scratch" before sidecars existed, taking its signed-in sessions with it.
+	const awkward = join(root, "chrome", "tmp-scratch");
+	mkdirSync(awkward, { recursive: true });
+	writeFileSync(join(awkward, "Cookies"), "SESSION", "utf8");
+	check("a pre-sidecar directory named tmp-* is still a saved profile", !ensureProfileMeta(awkward, "chrome").temporary);
+	await sweepTemporaryProfiles(root);
+	check("and the sweep does not delete it", existsSync(join(awkward, "Cookies")));
+	check("upgrading does not move it", existsSync(join(legacyDir, "Cookies")));
+	check("upgrading is idempotent", ensureProfileMeta(legacyDir, "chrome").createdAt === upgraded.createdAt);
+
+	// A saved profile's directory stays readable, and a second profile wanting the same one gets a
+	// suffix rather than colliding into the first profile's data.
+	const alpha = allocateSavedProfile(root, "brave", "Work");
+	const beta = allocateSavedProfile(root, "brave", "Work");
+	check("a saved profile gets a readable directory", alpha.dir.endsWith(join("brave", "Work")), alpha.dir);
+	check("a colliding directory name is suffixed", beta.dir.endsWith(join("brave", "Work-2")), beta.dir);
+	check("both keep the name they were given", alpha.meta.name === "Work" && beta.meta.name === "Work");
+
+	// The sweep must be certain rather than merely plausible: it deletes directories.
+	const orphan = allocateTemporaryProfile(root, "vivaldi");
+	const claimed = allocateTemporaryProfile(root, "vivaldi");
+	writeFileSync(
+		join(claimed.dir, ".pi-puppeteer-owner.json"),
+		JSON.stringify({ pid: process.pid, browserURL: "", browserKey: "vivaldi", profile: claimed.meta.id, cwd: root, startedAt: Date.now(), host: hostname(), state: "starting" }),
+		"utf8",
+	);
+	await sweepTemporaryProfiles(root);
+	check("the sweep removes an abandoned throwaway profile", !existsSync(orphan.dir));
+	check("the sweep leaves one a browser is still starting on", existsSync(claimed.dir));
+	check("the sweep never touches a saved profile", existsSync(first.dir) && existsSync(legacyDir) && existsSync(alpha.dir));
+}
+
 console.log("\nprofile name entry");
 
 {
-	const { profileNameState, printableInput, screenFrame } = await import("../src/index.ts");
+	const { controlLines, profileNameState, printableInput, screenFrame } = await import("../src/index.ts");
 
 	const taken = ["default", "work"];
 	check("a free name can be confirmed", profileNameState("scratch", "", taken).canConfirm);
@@ -246,15 +389,41 @@ console.log("\nprofile name entry");
 	check("case does not sneak a duplicate past", !profileNameState("WORK", "", taken).canConfirm);
 	check("renaming to the current name is allowed", profileNameState("work", "work", taken).canConfirm);
 	check("an empty name cannot be confirmed", !profileNameState("   ", "", taken).canConfirm);
-	// Illegal runs collapse to a dash and trailing dashes are trimmed, so the preview shows "My-Work".
-	check("illegal characters are shown sanitized", profileNameState("My Work!", "", taken).sanitized === "My-Work", JSON.stringify(profileNameState("My Work!", "", taken)));
-	check("a traversal cannot be confirmed as itself", profileNameState("..", "", taken).sanitized === "");
+	// The directory is named by a separate sanitized ID, so a display name survives punctuation intact.
+	check("a name is kept exactly as typed", profileNameState("My Work!", "", taken).name === "My Work!");
+	check("a punctuated name can be confirmed", profileNameState("My Work!", "", taken).canConfirm);
+	check("surrounding whitespace is trimmed", profileNameState("  work  ", "", taken).name === "work");
 
 	check("typed text is accepted", printableInput("abc") === "abc");
 	check("a paste is accepted whole", printableInput("my profile") === "my profile");
 	check("Enter is not treated as text", printableInput("\r") === undefined);
 	check("Escape sequences are not treated as text", printableInput("\x1b[D") === undefined);
 	check("backspace is not treated as text", printableInput("\x7f") === undefined);
+
+	// Control hints wrap only when they would otherwise be truncated. Truncation is not cosmetic here:
+	// the hints are ordered by how routine they are, so the first casualty is `Esc back` — the binding
+	// a stuck user reaches for.
+	{
+		const plain = { fg: (_color: unknown, text: string) => text, bold: (text: string) => text };
+		const hints = [
+			"[UD] move", "[Enter] show", "[N] new", "[L] load profile", "[S] save profile",
+			"[R] rename", "[D] close", "[B] change default browser", "[Esc] back",
+		];
+		check("a row that fits stays on one line", controlLines(plain, ["[N] new", "[Esc] back"], 76).length === 1);
+		for (const width of [24, 40, 80, 120]) {
+			const frame = screenFrame(plain, width);
+			// Judge the rendered line, not the packed one. A lone hint can be wider than the frame — at
+			// 24 columns "[B] change default browser" is — and the frame truncating that is correct.
+			const rendered = frame.clamp(controlLines(plain, hints, frame.innerWidth).map((line) => frame.boxed(line)));
+			const widths = [...new Set(rendered.map((line) => [...line].length))];
+			check(`controls render at exactly ${width} columns`, widths.length === 1 && widths[0] === width, widths.join("/"));
+			check(`controls wrap rather than truncate at ${width}`, width < 40 || rendered.length > 1 || width >= 140, `${rendered.length} line(s)`);
+		}
+		// Every hint has to survive the wrap; dropping one silently is the bug this replaced.
+		const packed = controlLines(plain, hints, 76).join(" ");
+		check("no hint is lost when wrapping", hints.every((hint) => packed.includes(hint)), packed);
+		check("a narrow frame still yields a line", controlLines(plain, hints, 8).length > 0);
+	}
 
 	// A real theme emits ANSI, which the padding helpers do not count; a zero-width stub isolates
 	// the geometry.
@@ -266,6 +435,8 @@ console.log("\nprofile name entry");
 			frame.boxed(frame.bold("New Profile — Microsoft Edge")),
 			frame.boxed(""),
 			frame.selectedLine("› work          ● in use by session-1"),
+			// The Browser Manager's widest row: name, browser, and the profile column added alongside.
+			frame.boxed("  Browser-1       Microsoft Edge  temporary"),
 			frame.boxed("[Enter] create  [Esc] cancel"),
 			frame.border("╰", "─", "╯"),
 		]);

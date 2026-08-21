@@ -5,7 +5,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ensureStorageDir, loadConfig } from "./config.ts";
-import { BrowserManager, sanitizeSegment } from "./manager.ts";
+import { BrowserManager } from "./manager.ts";
+import { sweepTemporaryProfiles } from "./profile-store.ts";
 import type { BrowserToolInput, RawExtensionConfig, ResolvedConfig, SessionSummary, WorkflowStep } from "./types.ts";
 
 async function writeProjectDefaultBrowser(cwd: string, config: ResolvedConfig, browserKey: string): Promise<void> {
@@ -47,7 +48,8 @@ function reportProfileMigration(ctx: ExtensionContext, config: ResolvedConfig): 
 	const locked = migration.pending.filter((entry) => entry.reason === "locked");
 	if (locked.length) {
 		ctx.ui.notify(
-			`Deferred ${locked.length} profile(s): a browser still has them open. Close it and restart Pi to finish the move.`,
+			`Deferred ${locked.length} profile(s) still held by a running browser, starting with ${locked[0]?.source}. ` +
+				"Close that browser and restart Pi to finish the move.",
 			"info",
 		);
 	}
@@ -203,18 +205,18 @@ async function showProfilePickerScreen(
 				}
 
 				const openLabel = selected?.inUse ? "connect" : "open";
-				const controls = deleteInProgress
-					? theme.fg("warning", "Deleting profile…")
+				const controls: string[] = deleteInProgress
+					? [theme.fg("warning", "Deleting profile…")]
 					: !profiles.length
 						? [
 							`${workflowKeycap(theme, "N", "accent")} new profile`,
 							`${workflowKeycap(theme, "Esc")} back`,
-						].join(theme.fg("dim", "  "))
+						]
 						: deleteArmed
 							? [
 								`${workflowKeycap(theme, "D", "warning")} confirm delete`,
 								`${workflowKeycap(theme, "Esc")} cancel`,
-							].join(theme.fg("dim", "  "))
+							]
 							: [
 								`${workflowKeycap(theme, "↑↓")} move`,
 								`${workflowKeycap(theme, "Enter", "accent")} ${openLabel}`,
@@ -222,19 +224,20 @@ async function showProfilePickerScreen(
 								`${workflowKeycap(theme, "R", "accent")} rename`,
 								`${workflowKeycap(theme, "D", "accent")} delete`,
 								`${workflowKeycap(theme, "Esc")} back`,
-							].join(theme.fg("dim", "  "));
+							];
 
-				// A running profile cannot be renamed or deleted: the browser holding it would break,
-				// and it may belong to a Pi session in another project.
+				// A running profile cannot be deleted: removing a live user data dir breaks the browser
+				// holding it, which may belong to a Pi session in another project. Renaming is safe —
+				// the name lives in a sidecar, so nothing on disk moves.
 				const hint = deleteArmed && selected
 					? theme.fg("warning", `Delete '${selected.profile}'? Signed-in sessions in it are lost.`)
 					: selected?.inUse
-						? theme.fg("dim", "Running profiles cannot be renamed or deleted. Enter connects to the browser.")
+						? theme.fg("dim", "Running profiles cannot be deleted. Enter connects to the browser.")
 						: "";
 				lines.push(boxed(""));
 				if (profiles.length) lines.push(boxed(hint));
 				lines.push(
-					boxed(controls),
+					...controlLines(theme, controls, innerWidth).map((line) => boxed(line)),
 					border("╰", "─", "╯"),
 				);
 				return clamp(lines);
@@ -277,10 +280,6 @@ async function showProfilePickerScreen(
 					return;
 				}
 				if (matchesShortcut(data, "r")) {
-					if (selected.inUse) {
-						ctx.ui.notify(`Cannot rename '${selected.profile}': a browser is running on it.`, "error");
-						return;
-					}
 					done({ type: "rename", profile: selected });
 					return;
 				}
@@ -346,7 +345,7 @@ async function chooseProfile(
 				title: "New Profile",
 				confirmLabel: "create",
 				browserLabel,
-				initial: suggestProfileName(entries),
+				initial: suggestProfileName(takenNames),
 				taken: takenNames,
 			});
 			if (name) return name;
@@ -376,8 +375,8 @@ async function chooseProfile(
 }
 
 /** Suggest a name no existing profile is using, so "New profile…" lands somewhere free. */
-function suggestProfileName(entries: ProfileListEntry[]): string {
-	const taken = new Set(entries.map((entry) => entry.profile.toLowerCase()));
+function suggestProfileName(names: string[]): string {
+	const taken = new Set(names.map((name) => name.trim().toLowerCase()));
 	if (!taken.has("default")) return "default";
 	let suffix = 2;
 	while (taken.has(`default-${suffix}`)) suffix += 1;
@@ -385,8 +384,8 @@ function suggestProfileName(entries: ProfileListEntry[]): string {
 }
 
 export interface ProfileNameState {
-	/** What the name becomes on disk; empty when nothing usable was typed. */
-	sanitized: string;
+	/** The name as it will be stored; empty when nothing usable was typed. */
+	name: string;
 	collides: boolean;
 	canConfirm: boolean;
 }
@@ -394,14 +393,15 @@ export interface ProfileNameState {
 /**
  * Judge a typed profile name once, for both the status line and the Enter key.
  *
- * Profile names become directory segments, so what is typed is not always what is stored. Deciding
- * it in one place keeps the status line and the key handler from drifting apart.
+ * Names are stored verbatim — the directory is named by a separate sanitized ID, so a profile can be
+ * called "My Work!" without that leaking into a path. Only emptiness and collisions can refuse a name,
+ * and deciding both in one place keeps the status line and the key handler from drifting apart.
  */
 export function profileNameState(value: string, initial: string, taken: Iterable<string>): ProfileNameState {
-	const sanitized = sanitizeSegment(value, "");
-	const takenNames = new Set([...taken].map((name) => name.toLowerCase()));
-	const collides = sanitized.toLowerCase() !== initial.toLowerCase() && takenNames.has(sanitized.toLowerCase());
-	return { sanitized, collides, canConfirm: Boolean(sanitized) && !collides };
+	const name = value.trim();
+	const takenNames = new Set([...taken].map((entry) => entry.trim().toLowerCase()));
+	const collides = name.toLowerCase() !== initial.trim().toLowerCase() && takenNames.has(name.toLowerCase());
+	return { name, collides, canConfirm: Boolean(name) && !collides };
 }
 
 /** Printable text, including a paste. Escape sequences and control keys are handled separately. */
@@ -417,9 +417,8 @@ export function printableInput(data: string): string | undefined {
 /**
  * Text entry for a profile name, rendered in the Browser Manager's frame.
  *
- * Profile names become directory segments, so what you type is not always what is stored. The field
- * shows the sanitized result as you type and refuses a name that is already taken, rather than
- * letting the manager reject it afterwards.
+ * Names are kept exactly as typed, so the field only has to refuse an empty name or one already taken,
+ * rather than letting the manager reject it afterwards.
  */
 async function showProfileNameScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
@@ -448,21 +447,19 @@ async function showProfileNameScreen(
 				const cursorCell = "bg" in theme && typeof theme.bg === "function" ? theme.bg("selectedBg", atCursor) : theme.fg("accent", atCursor);
 				const field = `${theme.fg("dim", label)}${theme.fg("text", before)}${cursorCell}${theme.fg("text", after)}`;
 
-				const { sanitized, collides, canConfirm } = profileNameState(value, options.initial, options.taken);
-				const status = !sanitized
+				const { name, collides, canConfirm } = profileNameState(value, options.initial, options.taken);
+				const status = !name
 					? theme.fg("dim", "Enter a profile name.")
 					: collides
-						? theme.fg("error", `A profile named '${sanitized}' already exists.`)
-						: sanitized !== value
-							? theme.fg("warning", `Saved as '${sanitized}'.`)
-							: theme.fg("dim", `${options.browserLabel} profile.`);
+						? theme.fg("error", `A profile named '${name}' already exists.`)
+						: theme.fg("dim", `${options.browserLabel} profile.`);
 
-				const controls = [
+				const controls: string[] = [
 					canConfirm
 						? `${workflowKeycap(theme, "Enter", "accent")} ${options.confirmLabel}`
 						: theme.fg("dim", `[Enter] ${options.confirmLabel}`),
 					`${workflowKeycap(theme, "Esc")} cancel`,
-				].join(theme.fg("dim", "  "));
+				];
 
 				return clamp([
 					border("╭", "─", "╮"),
@@ -471,7 +468,7 @@ async function showProfileNameScreen(
 					boxed(field),
 					boxed(""),
 					boxed(status),
-					boxed(controls),
+					...controlLines(theme, controls, innerWidth).map((line) => boxed(line)),
 					border("╰", "─", "╯"),
 				]);
 			},
@@ -534,8 +531,8 @@ async function showProfileNameScreen(
 					return;
 				}
 				if (selectKey === "confirm") {
-					const { sanitized, canConfirm } = profileNameState(value, options.initial, options.taken);
-					if (canConfirm) done(sanitized);
+					const { name, canConfirm } = profileNameState(value, options.initial, options.taken);
+					if (canConfirm) done(name);
 				}
 			},
 		};
@@ -582,6 +579,8 @@ type WorkflowLibraryAction =
 type SessionManagerAction =
 	| { type: "exit" }
 	| { type: "create" }
+	| { type: "create-with-profile" }
+	| { type: "save"; session: SessionSummary }
 	| { type: "change-default-browser" }
 	| { type: "show"; session: SessionSummary }
 	| { type: "rename"; session: SessionSummary }
@@ -767,6 +766,41 @@ export function screenFrame(theme: ScreenTheme, width: number): ScreenFrame {
 		},
 		clamp: (lines) => lines.map((line) => truncateAnsi(line, width)),
 	};
+}
+
+/** Gap between two control hints, and the indent a wrapped line is not given. */
+const CONTROL_GAP = "  ";
+
+/**
+ * Lay control hints out across as few lines as they fit on.
+ *
+ * One line is the common case and stays exactly as it was. The row only wraps when it would otherwise
+ * be truncated, and truncation here is worse than it looks: the hints are ordered by how routine they
+ * are, so the first thing an 80-column terminal loses is `Esc back` — the one binding a user reaches
+ * for when they are stuck. Shared for the same reason `screenFrame` is: every screen's controls should
+ * behave identically. The workflow library keeps its own separator and is left alone.
+ */
+export function controlLines(theme: ScreenTheme, hints: string[], innerWidth: number): string[] {
+	const separator = theme.fg("dim", CONTROL_GAP);
+	const lines: string[] = [];
+	let current: string[] = [];
+	let currentWidth = 0;
+
+	for (const hint of hints) {
+		const hintWidth = stripAnsi(hint).length;
+		const projected = current.length ? currentWidth + CONTROL_GAP.length + hintWidth : hintWidth;
+		if (current.length && projected > innerWidth) {
+			lines.push(current.join(separator));
+			current = [hint];
+			currentWidth = hintWidth;
+			continue;
+		}
+		current.push(hint);
+		currentWidth = projected;
+	}
+	if (current.length) lines.push(current.join(separator));
+	// A hint wider than the frame still has to produce a line; the frame truncates it.
+	return lines.length ? lines : [""];
 }
 
 type SelectKeyAction = "up" | "down" | "confirm" | "cancel";
@@ -1164,6 +1198,13 @@ function setBrowserSessionsStatus(ctx: WorkflowStatusUiContext, count: number): 
 	ctx.ui.setWidget(BROWSER_SESSIONS_WIDGET_KEY, widgetFactory, { placement: "aboveEditor" });
 }
 
+/** How a session's profile reads in the manager: kept and named, throwaway, or someone else's browser. */
+function sessionProfileLabel(session: SessionSummary): string {
+	if (session.mode === "attach") return "attached";
+	if (session.temporary) return "temporary";
+	return session.profile ?? "—";
+}
+
 async function showBrowserSessionsScreen(
 	ctx: ExtensionCommandContext | ExtensionContext,
 	sessions: SessionSummary[],
@@ -1219,15 +1260,32 @@ async function showBrowserSessionsScreen(
 					const row = (columns: Array<[string, number]>) => columns.map(([content, columnWidth]) => column(content, columnWidth)).join(gap);
 					const nameWidth = Math.min(24, Math.max("Name".length, ...sessions.map((session) => session.name.length + 2)));
 					const minBrowserWidth = 10;
+					const minProfileWidth = 9;
 					const naturalBrowserWidth = Math.min(28, Math.max("Browser".length, ...sessions.map((session) => session.displayName.length)));
+					const naturalProfileWidth = Math.min(20, Math.max("Profile".length, ...sessions.map((session) => sessionProfileLabel(session).length)));
 					const fullTableFixedWidth = nameWidth + gap.length;
 					const useFullTable = fullTableFixedWidth + minBrowserWidth <= innerWidth;
+					// The profile column is the first thing to go on a narrow terminal: which browser a
+					// session is driving matters more than whether its profile is being kept.
+					const withProfile = useFullTable && fullTableFixedWidth + minBrowserWidth + gap.length + minProfileWidth <= innerWidth;
+					const profileWidth = withProfile
+						? Math.min(naturalProfileWidth, innerWidth - fullTableFixedWidth - minBrowserWidth - gap.length)
+						: 0;
 					const browserWidth = useFullTable
-						? Math.min(naturalBrowserWidth, Math.max(minBrowserWidth, innerWidth - fullTableFixedWidth))
+						? Math.min(
+							naturalBrowserWidth,
+							Math.max(minBrowserWidth, innerWidth - fullTableFixedWidth - (withProfile ? profileWidth + gap.length : 0)),
+						)
 						: 0;
 					const compactDetailsWidth = Math.max(1, innerWidth - nameWidth - gap.length);
 
-					if (useFullTable) {
+					if (withProfile) {
+						lines.push(boxed(row([
+							[theme.fg("dim", "Name"), nameWidth],
+							[theme.fg("dim", "Browser"), browserWidth],
+							[theme.fg("dim", "Profile"), profileWidth],
+						])));
+					} else if (useFullTable) {
 						lines.push(boxed(row([
 							[theme.fg("dim", "Name"), nameWidth],
 							[theme.fg("dim", "Browser"), browserWidth],
@@ -1246,10 +1304,15 @@ async function showBrowserSessionsScreen(
 						const name = theme.fg(isSelected ? "accent" : "text", session.name);
 						const browser = theme.fg(isSelected ? "accent" : "text", session.displayName);
 						const nameCell = `${marker} ${name}`;
-						const renderedRow = row([
+						const columns: Array<[string, number]> = [
 							[nameCell, nameWidth],
 							[browser, useFullTable ? browserWidth : compactDetailsWidth],
-						]);
+						];
+						if (withProfile) {
+							const label = sessionProfileLabel(session);
+							columns.push([theme.fg(session.temporary ? "muted" : isSelected ? "accent" : "text", label), profileWidth]);
+						}
+						const renderedRow = row(columns);
 						lines.push(isSelected ? selectedLine(renderedRow) : boxed(renderedRow));
 					}
 					if (end < sessions.length) lines.push(boxed(theme.fg("dim", `… ${sessions.length - end} more`)));
@@ -1257,31 +1320,41 @@ async function showBrowserSessionsScreen(
 
 				const stopActionLabel = selected?.mode === "attach" ? "detach" : "close";
 				const confirmStopActionLabel = selected?.mode === "attach" ? "confirm detach" : "confirm close";
-				const controls = closeInProgress
-					? theme.fg("warning", selected?.mode === "attach" ? "Detaching browser…" : "Closing browser…")
+				const controls: string[] = closeInProgress
+					? [theme.fg("warning", selected?.mode === "attach" ? "Detaching browser…" : "Closing browser…")]
 					: !sessions.length
 						? [
-							`${workflowKeycap(theme, "N", "accent")} open`,
+							`${workflowKeycap(theme, "N", "accent")} new`,
+							`${workflowKeycap(theme, "L", "accent")} load profile`,
 							`${workflowKeycap(theme, "B", "accent")} change default browser`,
 							`${workflowKeycap(theme, "Esc")} back`,
-						].join(theme.fg("dim", "  "))
+						]
 						: closeArmed
 							? [
 								`${workflowKeycap(theme, "D", "warning")} ${confirmStopActionLabel}`,
 								`${workflowKeycap(theme, "Esc")} cancel`,
-							].join(theme.fg("dim", "  "))
+							]
 							: [
 								`${workflowKeycap(theme, "↑↓")} move`,
 								`${workflowKeycap(theme, "Enter", "accent")} show`,
 								`${workflowKeycap(theme, "N", "accent")} new`,
+								`${workflowKeycap(theme, "L", "accent")} load profile`,
+								// Offered only where it means something: a saved session is already kept.
+								...(selected?.temporary ? [`${workflowKeycap(theme, "S", "accent")} save profile`] : []),
 								`${workflowKeycap(theme, "R", "accent")} rename`,
 								`${workflowKeycap(theme, "D", "accent")} ${stopActionLabel}`,
 								`${workflowKeycap(theme, "B", "accent")} change default browser`,
 								`${workflowKeycap(theme, "Esc")} back`,
-							].join(theme.fg("dim", "  "));
+							];
+				// Closing is the one irreversible step in the throwaway flow, and it is already behind a
+				// two-press confirm, so naming what goes with it costs nothing and prevents a silent loss.
+				const hint = closeArmed && selected?.temporary
+					? theme.fg("warning", "Temporary — closing discards its signed-in sessions. Esc, then S to keep.")
+					: "";
+				lines.push(boxed(""));
+				if (hint) lines.push(boxed(hint));
 				lines.push(
-					boxed(""),
-					boxed(controls),
+					...controlLines(theme, controls, innerWidth).map((line) => boxed(line)),
 					border("╰", "─", "╯"),
 				);
 				return clamp(lines);
@@ -1293,6 +1366,10 @@ async function showBrowserSessionsScreen(
 				if (closeInProgress) return;
 				if (matchesShortcut(data, "n")) {
 					done({ type: "create" });
+					return;
+				}
+				if (matchesShortcut(data, "l")) {
+					done({ type: "create-with-profile" });
 					return;
 				}
 				if (matchesShortcut(data, "b")) {
@@ -1325,6 +1402,19 @@ async function showBrowserSessionsScreen(
 				if (!selected) return;
 				if (selectKey === "confirm") {
 					done({ type: "show", session: selected });
+					return;
+				}
+				if (matchesShortcut(data, "s")) {
+					if (!selected.temporary) {
+						ctx.ui.notify(
+							selected.mode === "attach"
+								? `${selected.id} is attached to a browser Pi did not launch, so it has no profile to save.`
+								: `${selected.id} already uses saved profile '${selected.profile}'.`,
+							"error",
+						);
+						return;
+					}
+					done({ type: "save", session: selected });
 					return;
 				}
 				if (matchesShortcut(data, "r")) {
@@ -1385,10 +1475,15 @@ async function openBrowserSessionsManager(
 				browserManager.setConfig(nextConfig);
 				const resolved = selectedKey === "system" ? ` (resolves to '${nextConfig.defaultBrowser}')` : "";
 				ctx.ui.notify(`Default browser set to '${selectedKey}'${resolved}.`, "info");
-			} else if (action.type === "create") {
-				const defaultBrowserLabel = config.browsers[config.defaultBrowser]?.displayName ?? config.defaultBrowser;
-				const chosenProfile = await chooseProfile(ctx, browserManager, config.defaultBrowser, defaultBrowserLabel);
-				if (!chosenProfile) continue;
+			} else if (action.type === "create" || action.type === "create-with-profile") {
+				// Opening a browser asks nothing by default. Persistence is a deliberate choice, so only
+				// the explicit "with profile" path shows the picker.
+				let chosenProfile: string | undefined;
+				if (action.type === "create-with-profile") {
+					const defaultBrowserLabel = config.browsers[config.defaultBrowser]?.displayName ?? config.defaultBrowser;
+					chosenProfile = await chooseProfile(ctx, browserManager, config.defaultBrowser, defaultBrowserLabel);
+					if (!chosenProfile) continue;
+				}
 
 				const existingNames = new Set(sessions.map((session) => session.name.toLowerCase()));
 				let suggestedNumber = 1;
@@ -1401,6 +1496,24 @@ async function openBrowserSessionsManager(
 				const session = started.details.session as SessionSummary | undefined;
 				selectedSessionId = session?.id;
 				ctx.ui.notify(started.text, "info");
+			} else if (action.type === "save") {
+				const browserLabel = action.session.displayName;
+				const listed = await browserManager.execute({ action: "list_profiles", browserKey: action.session.browserKey });
+				const taken = ((listed.details.profiles as ProfileListEntry[] | undefined) ?? []).map((entry) => entry.profile);
+				const name = await showProfileNameScreen(ctx, {
+					title: "Save Profile",
+					confirmLabel: "save",
+					browserLabel,
+					initial: suggestProfileName(taken),
+					taken,
+				});
+				if (!name) continue;
+				const saved = await browserManager.execute({
+					action: "save_profile",
+					sessionId: action.session.id,
+					targetProfile: name,
+				});
+				ctx.ui.notify(saved.text, "info");
 			} else if (action.type === "show") {
 				const shown = await browserManager.execute({ action: "show_session", sessionId: action.session.id });
 				ctx.ui.notify(shown.text, "info");
@@ -1502,6 +1615,7 @@ const BrowserToolSchema = Type.Object({
 			"list_profiles",
 			"rename_profile",
 			"delete_profile",
+			"save_profile",
 			"start",
 			"attach",
 			"sessions",
@@ -1542,7 +1656,7 @@ const BrowserToolSchema = Type.Object({
 	profile: Type.Optional(
 		Type.String({
 			description:
-				"Named profile for launch mode. Profiles are shared across projects, so use list_profiles first to see which are already running.",
+				"Saved profile to launch with. Omit it for a throwaway session whose cookies and logins are discarded when it closes — that is the right default for most tasks. A name that does not exist yet is created. Saved profiles are shared across projects, so use list_profiles first to see which are already running.",
 		}),
 	),
 	url: Type.Optional(Type.String({ description: "URL for start, new_tab, or navigate" })),
@@ -1574,7 +1688,7 @@ const BrowserToolSchema = Type.Object({
 	workflowId: Type.Optional(Type.String({ description: "Saved workflow ID for workflow_replay, workflow_rename, workflow_delete, or workflow_export" })),
 	workflowName: Type.Optional(Type.String({ description: "Workflow name for recording or lookup" })),
 	targetWorkflowName: Type.Optional(Type.String({ description: "New workflow name for workflow_rename" })),
-	targetProfile: Type.Optional(Type.String({ description: "New profile name for rename_profile" })),
+	targetProfile: Type.Optional(Type.String({ description: "Profile name for rename_profile and save_profile" })),
 	scriptFormat: Type.Optional(StringEnum(["puppeteer", "browser_tool"] as const)),
 });
 
@@ -1586,7 +1700,9 @@ const WorkflowReplayToolSchema = Type.Object({
 	sessionId: Type.Optional(Type.String({ description: "Browser session ID, like session-1" })),
 	tabId: Type.Optional(Type.String({ description: "Tab ID, like tab-1" })),
 	browserKey: Type.Optional(Type.String({ description: "Browser key used if a new session must be started" })),
-	profile: Type.Optional(Type.String({ description: "Profile used if a new session must be started" })),
+	profile: Type.Optional(
+		Type.String({ description: "Saved profile used if a new session must be started. Omit for a throwaway session." }),
+	),
 	headless: Type.Optional(Type.Boolean({ description: "Override launch headless mode for auto-started sessions" })),
 	timeoutMs: Type.Optional(Type.Number({ description: "Timeout override in milliseconds" })),
 });
@@ -1605,6 +1721,10 @@ export default function (pi: ExtensionAPI) {
 		const startupConfig = loadConfig(ctx.cwd);
 		manager = new BrowserManager(ctx.cwd, startupConfig);
 		reportProfileMigration(ctx, startupConfig);
+		// A throwaway profile is removed when its session closes, but a crash or a killed terminal skips
+		// that and leaves a few hundred megabytes behind. Sweeping on start is the backstop; it probes
+		// each candidate for a live browser, so it must not hold up the session.
+		void sweepTemporaryProfiles(startupConfig.profileRoot).catch(() => undefined);
 		workflowUi = new WorkflowRecordingUiController(ctx, () => {
 			manager ??= new BrowserManager(ctx.cwd, loadConfig(ctx.cwd));
 			return manager;
@@ -1714,8 +1834,11 @@ export default function (pi: ExtensionAPI) {
 			"Use browser start or browser attach before page actions when no browser session is open.",
 			"Use browser inspect or browser extract_text instead of dumping large page HTML into context.",
 			"Use workflow_list, workflow_replay, and workflow_details for saved workflow execution; use browser workflow_record_start/workflow_record_stop to record new workflows.",
-			"Profiles are shared across projects. Use browser list_profiles before starting a session on a named profile: starting on one that is already running connects to that browser instead of opening a new window.",
-			"Use rename_profile and delete_profile to manage saved profiles. Neither works while a browser is running on the profile, and delete_profile permanently discards its signed-in sessions, so confirm with the user first.",
+			"Sessions started without a profile are throwaway: nothing they sign in to survives the session. Start one whenever persistence is not the point, and pass a profile only when a signed-in state has to outlive the browser.",
+			"Every start without a profile opens a separate browser. Keep working through the sessionId you already have rather than calling start again.",
+			"Use save_profile with a targetProfile to keep a throwaway session's signed-in state. It applies immediately and the browser keeps running, so it is the right answer after signing in to something worth reusing. Ask the user before saving: a saved profile persists credentials on disk.",
+			"Saved profiles are shared across projects. Use browser list_profiles before starting a session on one: starting on a profile that is already running connects to that browser instead of opening a new window.",
+			"Use rename_profile and delete_profile to manage saved profiles. rename_profile works while a browser is running; delete_profile does not, and permanently discards the profile's signed-in sessions, so confirm with the user first.",
 		],
 		parameters: BrowserToolSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

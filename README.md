@@ -55,8 +55,10 @@ After installation, you can ask Pi things like:
 
 Run `/browser` in Pi to open the browser manager. From there, you can:
 
-- open the default browser
-- choose the project default browser
+- open the default browser (`N`) — a throwaway session that leaves nothing behind
+- open it on a saved profile instead (`L`)
+- save a throwaway session as a named profile (`S`), without closing the browser
+- choose the project default browser (`B`)
 - view active browser sessions
 - rename a session
 - show, close, or detach from a session
@@ -110,6 +112,25 @@ A typical project config looks like this:
 
 Use `defaultBrowser: "system"` to follow your OS default browser, or set it to a configured browser key such as `chrome`, `edge`, `brave`, or a custom entry like `edge-work`.
 
+### Profiles are optional
+
+Opening a browser does not ask you about profiles. By default a session is **throwaway**: it gets a
+fresh, private profile directory, and everything it accumulates — cookies, logins, cache — is deleted
+when the session closes. That is what you want for most automation, and it means several browsers can
+run side by side, which a single shared profile makes impossible.
+
+When a session turns out to be worth keeping, save it:
+
+- In the browser manager, press `S` and give it a name.
+- Or ask Pi: "save this browser as `work`."
+
+Saving takes effect immediately and **the browser keeps running** — nothing closes, restarts, or is
+copied. Afterwards the profile behaves like any other saved one: press `L` in the browser manager, or
+ask Pi to start a session with `profile: "work"`, and you are still signed in.
+
+A profile name that does not exist yet is created on first use, so
+"open Chrome with the `work` profile" works before `work` exists.
+
 ### Where profiles are stored
 
 `profileScope` controls where named browser profiles live:
@@ -122,8 +143,12 @@ Use `defaultBrowser: "system"` to follow your OS default browser, or set it to a
 Set `profileRoot` to override the location outright. It accepts an absolute path or a `~/`-prefixed
 one, and takes precedence over `profileScope`.
 
-Because profiles are shared, one may already have a browser running on it — possibly started by Pi in
-a different project. Ask before you launch:
+A profile's directory is named by an ID, and the name you gave it is recorded in a
+`.pi-puppeteer-profile.json` file inside. That is what lets a profile be saved or renamed while its
+browser is running: only that small file changes, and the live profile directory is never moved.
+
+Because saved profiles are shared across projects, one may already have a browser running on it —
+possibly started by Pi in a different project. Ask before you launch:
 
 - “List my browser profiles.” (`list_profiles`) reports every profile and whether it is in use, and
   names the project that started it.
@@ -135,14 +160,15 @@ connects you to that browser rather than opening a second window.
 ### Managing profiles
 
 The profile picker doubles as a profile manager — `N` for a new profile, `R` to rename, `D` twice to
-delete. The same actions are available to Pi as `rename_profile` and `delete_profile`.
+delete. The same actions are available to Pi as `save_profile`, `rename_profile`, and `delete_profile`.
 
-Profile names become directory names, so the naming screen previews what will actually be stored
-(`My Work!` is saved as `My-Work`) and refuses a name that is already in use.
+Names are kept exactly as you type them, punctuation included; the picker only refuses a name that is
+already in use.
 
-Neither works while a browser is running on the profile, including one started by Pi in another
-project: close it first. Deleting a profile permanently discards everything it holds, including the
-sites it was signed in to.
+Renaming works at any time, including while a browser is running on the profile. Deleting does not —
+a live profile directory cannot be removed without corrupting the browser holding it, so close that
+browser first, even if it was started by Pi in another project. Deleting a profile permanently
+discards everything it holds, including the sites it was signed in to.
 
 ## Screenshots and recordings
 
@@ -204,7 +230,10 @@ screenshot, recording, workflow, or setting does.
 
 **Global storage** — `~/.pi/agent/extensions/pi-puppeteer/`
 
-- `profiles/<browser>/<profile>` — persistent browser profiles
+- `profiles/<browser>/<id>` — browser profiles, saved and throwaway alike
+
+Throwaway profiles are removed when their session closes. If Pi is killed before that happens, the
+next Pi session sweeps up whatever was left behind.
 
 Profiles live outside your repositories for two reasons. A browser profile holds cookies and session
 tokens, and a single Chromium profile routinely runs to hundreds of megabytes across thousands of
@@ -217,6 +246,8 @@ against the project directory rather than the artifact root.
 
 ## Notes
 
+- Sessions are throwaway unless you name a profile. Nothing a throwaway session signs in to survives
+  it closing, and every launch without a profile opens a separate browser.
 - Browser launches are headed by default. Pass `headless: true` when you want a headless session.
 - Attach mode requires the target Chromium browser to be running with remote debugging enabled.
 - Attached browsers are disconnected, not forcibly closed, when Pi shuts down.

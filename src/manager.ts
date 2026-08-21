@@ -1,14 +1,23 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Browser, Page } from "puppeteer-core";
 import { KnownDevices } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
 import { ensureStorageDir } from "./config.ts";
-import { discoverProfiles, inspectProfile } from "./profile-lock.ts";
+import { inspectProfile } from "./profile-lock.ts";
+import {
+	allocateSavedProfile,
+	allocateTemporaryProfile,
+	assertInsideRoot,
+	discardProfile,
+	discoverProfiles,
+	nameProfile,
+	resolveProfileByName,
+	sanitizeSegment,
+} from "./profile-store.ts";
 import {
 	createWorkflowId,
 	deleteWorkflow,
@@ -58,24 +67,6 @@ function truncate(value: string, max = 4000): string {
 	return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
 }
 
-// Profile names become path segments under a shared root, so `.` and `..` must never survive: a
-// profile named ".." would resolve outside the profile root and into the Pi agent directory.
-export function sanitizeSegment(value: string | undefined, fallback: string): string {
-	const base = (value ?? fallback).trim() || fallback;
-	const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[.-]+|[.-]+$/g, "");
-	return cleaned || fallback;
-}
-
-// Profile roots are now shared and live under the Pi agent directory, so a crafted segment escaping
-// the root would land in Pi's own configuration. Sanitizing is the first line of defence; this is the
-// second.
-function assertInsideRoot(root: string, candidate: string): void {
-	const prefix = resolve(root) + sep;
-	if (!resolve(candidate).startsWith(prefix)) {
-		throw new Error("Resolved profile path escapes the profile root.");
-	}
-}
-
 export class BrowserManager {
 	private sessions = new Map<string, BrowserSessionRecord>();
 	private recentlyRemovedSessions = new Map<string, RemovedSessionRecord>();
@@ -120,6 +111,8 @@ export class BrowserManager {
 				return this.renameProfile(input);
 			case "delete_profile":
 				return this.deleteProfile(input);
+			case "save_profile":
+				return this.saveProfile(input);
 			case "start":
 				return this.start(input);
 			case "attach":
@@ -239,6 +232,7 @@ export class BrowserManager {
 				browserKey: entry.browserKey,
 				displayName: this.config.browsers[entry.browserKey]?.displayName ?? entry.browserKey,
 				profile: entry.profile,
+				id: entry.id,
 				path: entry.path,
 				inUse: entry.state !== "free",
 				state: entry.state,
@@ -270,23 +264,30 @@ export class BrowserManager {
 		};
 	}
 
+	/** Resolve a saved profile by the display name the caller asked for. */
+	private resolveSavedProfile(input: BrowserToolInput, verb: string): { browserKey: string; profile: string; dir: string } {
+		const browserKey = this.resolveBrowserKey(input.browserKey);
+		const requested = input.profile?.trim();
+		if (!requested) throw new Error(`A profile name is required to ${verb} a profile.`);
+
+		const found = resolveProfileByName(this.config.profileRoot, browserKey, requested);
+		if (!found) throw new Error(`No profile '${requested}' exists for ${browserKey}.`);
+		assertInsideRoot(this.config.profileRoot, found.dir);
+		return { browserKey, profile: found.meta.name, dir: found.dir };
+	}
+
 	/**
-	 * Resolve a profile directory for a management action, refusing anything currently running.
+	 * Resolve a saved profile, refusing one a browser is currently running on.
 	 *
-	 * Renaming or deleting a profile out from under a live browser corrupts it, and the browser may
-	 * belong to a Pi session in a different project.
+	 * Only deletion needs this now. Renaming is a sidecar write and is safe on a live profile; removing
+	 * a live user data dir is not, and the browser holding it may belong to a Pi session in another
+	 * project.
 	 */
 	private async resolveIdleProfile(
 		input: BrowserToolInput,
 		verb: string,
 	): Promise<{ browserKey: string; profile: string; dir: string }> {
-		const browserKey = this.resolveBrowserKey(input.browserKey);
-		const profile = sanitizeSegment(input.profile, "");
-		if (!profile) throw new Error(`A profile name is required to ${verb} a profile.`);
-
-		const dir = join(this.config.profileRoot, sanitizeSegment(browserKey, "browser"), profile);
-		assertInsideRoot(this.config.profileRoot, dir);
-		if (!existsSync(dir)) throw new Error(`No profile '${profile}' exists for ${browserKey}.`);
+		const { browserKey, profile, dir } = this.resolveSavedProfile(input, verb);
 
 		const openHere = [...this.sessions.values()].find(
 			(session) => session.mode === "launch" && session.browserKey === browserKey && session.profile === profile,
@@ -305,21 +306,59 @@ export class BrowserManager {
 		return { browserKey, profile, dir };
 	}
 
+	/**
+	 * Rename a profile.
+	 *
+	 * The name lives in a sidecar rather than in the directory name, so this works while a browser is
+	 * running on the profile: nothing on disk moves, and the running browser is unaffected.
+	 */
 	private async renameProfile(input: BrowserToolInput): Promise<ToolResponse> {
-		const { browserKey, profile, dir } = await this.resolveIdleProfile(input, "rename");
+		const { browserKey, profile, dir } = this.resolveSavedProfile(input, "rename");
 
-		const target = sanitizeSegment(input.targetProfile, "");
+		const target = input.targetProfile?.trim();
 		if (!target) throw new Error("A new profile name is required.");
-		if (target === profile) throw new Error(`Profile '${profile}' already has that name.`);
+		if (target.toLowerCase() === profile.toLowerCase()) throw new Error(`Profile '${profile}' already has that name.`);
+		if (resolveProfileByName(this.config.profileRoot, browserKey, target)) {
+			throw new Error(`A profile named '${target}' already exists for ${browserKey}.`);
+		}
 
-		const targetDir = join(this.config.profileRoot, sanitizeSegment(browserKey, "browser"), target);
-		assertInsideRoot(this.config.profileRoot, targetDir);
-		if (existsSync(targetDir)) throw new Error(`A profile named '${target}' already exists for ${browserKey}.`);
-
-		await rename(dir, targetDir);
+		nameProfile(dir, browserKey, target);
+		for (const session of this.sessions.values()) {
+			if (session.browserKey === browserKey && session.profileDir === dir) session.profile = target;
+		}
 		return {
 			text: `Renamed profile '${profile}' to '${target}' for ${browserKey}.`,
-			details: { action: "rename_profile", browserKey, profile: target, previousProfile: profile, path: targetDir },
+			details: { action: "rename_profile", browserKey, profile: target, previousProfile: profile, path: dir },
+		};
+	}
+
+	/**
+	 * Keep a throwaway session's profile, giving it a name.
+	 *
+	 * This is a single sidecar write, so the browser keeps running: the user signs in, decides they want
+	 * to keep it, and nothing closes or restarts.
+	 */
+	private async saveProfile(input: BrowserToolInput): Promise<ToolResponse> {
+		const session = this.resolveSession(input.sessionId);
+		const target = (input.targetProfile ?? input.name)?.trim();
+		if (!target) throw new Error("A profile name is required to save a session.");
+		if (!session.profileDir) {
+			throw new Error(`${session.id} has no profile to save. Attached sessions use the browser's own profile.`);
+		}
+		if (!session.temporary) {
+			throw new Error(`${session.id} already uses saved profile '${session.profile}'. Use rename_profile to rename it.`);
+		}
+		if (resolveProfileByName(this.config.profileRoot, session.browserKey, target)) {
+			throw new Error(`A profile named '${target}' already exists for ${session.browserKey}.`);
+		}
+
+		const meta = nameProfile(session.profileDir, session.browserKey, target);
+		// Clearing the flag is what cancels the discard in this session's dispose.
+		session.temporary = false;
+		session.profile = meta.name;
+		return {
+			text: `Saved ${session.id} as profile '${meta.name}'. It stays signed in and the browser keeps running.`,
+			details: { action: "save_profile", sessionId: session.id, profile: meta.name, path: session.profileDir },
 		};
 	}
 
@@ -348,17 +387,24 @@ export class BrowserManager {
 		}
 
 		const requestedName = this.normalizeSessionName(input.name);
-		// The session label is a display name, not an identity. Deriving the profile from it used to
-		// be harmless because profiles were project-local; now that they are shared across projects,
-		// auto-generated labels like "Browser-1" would collide between unrelated repositories. Ask
-		// for a profile explicitly when a separate one is wanted.
-		const profile = sanitizeSegment(input.profile, "default");
-		const userDataDir = join(this.config.profileRoot, sanitizeSegment(browserKey, "browser"), profile);
+		// No `profile` means a throwaway session: a fresh user data dir that is discarded when the
+		// browser closes. Persistence is opt-in because most automation neither needs nor wants a
+		// signed-in profile accumulating on disk, and because a unique directory per launch is the
+		// only way several browsers can run at once — Chromium allows one process per --user-data-dir.
+		const requestedProfile = input.profile?.trim();
+		const temporary = !requestedProfile;
+		const { dir: userDataDir, meta } = temporary
+			? allocateTemporaryProfile(this.config.profileRoot, browserKey)
+			: (resolveProfileByName(this.config.profileRoot, browserKey, requestedProfile) ??
+				allocateSavedProfile(this.config.profileRoot, browserKey, requestedProfile));
 		assertInsideRoot(this.config.profileRoot, userDataDir);
 		await mkdir(userDataDir, { recursive: true });
+		const profile = meta.name;
 
-		return this.withLaunchSessionLock(browserKey, profile, async () => {
-			const existingSession = await this.findReusableLaunchSession(browserKey, profile);
+		return this.withLaunchSessionLock(browserKey, meta.id, async () => {
+			// A throwaway profile is unique to this launch, so there is nothing to reuse or adopt and
+			// every `start` deliberately yields a separate browser.
+			const existingSession = temporary ? undefined : await this.findReusableLaunchSession(browserKey, profile);
 			if (existingSession) {
 				return this.reuseLaunchSession(existingSession, input, userDataDir);
 			}
@@ -380,7 +426,15 @@ export class BrowserManager {
 				engine: definition.engine,
 				mode: "launch",
 				profile,
-				dispose,
+				profileDir: userDataDir,
+				temporary,
+				// Discard a throwaway profile only once the browser has actually exited: removing a live
+				// user data dir leaves Chromium writing into deleted files. `session.temporary` is read
+				// at teardown rather than captured, so save_profile can cancel the discard.
+				dispose: async () => {
+					await dispose?.();
+					if (session.temporary) discardProfile(userDataDir);
+				},
 				adopted,
 			});
 
@@ -400,12 +454,18 @@ export class BrowserManager {
 					? `Adopted the ${definition.displayName} window already open on shared profile '${profile}'` +
 						`${ownerCwd && ownerCwd !== this.cwd ? ` (started by Pi in ${ownerCwd})` : ""} as ${session.id}${opened}.` +
 						" It stays open when this session ends. Pass a different `profile` for a separate window."
-					: `Started ${session.name} (${definition.displayName}, ${session.id})${opened}.`,
+					: temporary
+						? `Started ${session.name} (${definition.displayName}, ${session.id})${opened}.` +
+							" This is a throwaway session: nothing it signs in to is kept once it closes." +
+							" Use save_profile to keep it."
+						: `Started ${session.name} (${definition.displayName}, ${session.id}) on profile '${profile}'${opened}.`,
 				details: {
 					action: "start",
 					session: await this.summarizeSession(session),
 					tabs,
 					profilePath: userDataDir,
+					profile: temporary ? null : profile,
+					temporary,
 					adopted,
 					ownerCwd: ownerCwd ?? null,
 				},
@@ -454,7 +514,10 @@ export class BrowserManager {
 
 		return {
 			text: `Open sessions:\n${sessions
-				.map((session) => `${session.name} (${session.id}): ${session.displayName} (${session.mode}, ${session.tabCount} tab${session.tabCount === 1 ? "" : "s"})${session.current ? " · active" : ""}`)
+				.map((session) => {
+					const profile = session.temporary ? "temporary" : session.profile ? `profile '${session.profile}'` : session.mode;
+					return `${session.name} (${session.id}): ${session.displayName} (${profile}, ${session.tabCount} tab${session.tabCount === 1 ? "" : "s"})${session.current ? " · active" : ""}`;
+				})
 				.join("\n")}`,
 			details: { action: "sessions", currentSessionId: this.currentSessionId ?? null, sessions },
 		};
@@ -961,7 +1024,10 @@ export class BrowserManager {
 			tabId,
 			page,
 			browserKey: session.browserKey,
-			profile: session.profile,
+			// A throwaway session's `profile` is its generated directory id, which must not be saved as
+			// something to reopen: replay would create a real profile named "tmp-mf3k2a-9c17". Recording
+			// no profile is also the truthful answer — the flow was captured signed in to nothing.
+			profile: session.temporary ? undefined : session.profile,
 			startedAt: Date.now(),
 			steps: [],
 			active: true,
@@ -1419,6 +1485,8 @@ export class BrowserManager {
 		engine: "chromium" | "firefox";
 		mode: "launch" | "attach";
 		profile?: string;
+		profileDir?: string;
+		temporary?: boolean;
 		dispose?: () => Promise<void>;
 		adopted?: boolean;
 	}): Promise<BrowserSessionRecord> {
@@ -1431,6 +1499,8 @@ export class BrowserManager {
 			engine: input.engine,
 			mode: input.mode,
 			profile: input.profile,
+			profileDir: input.profileDir,
+			temporary: input.temporary ?? false,
 			adopted: input.adopted,
 			browser: input.browser,
 			pages: new Map<string, Page>(),
@@ -1534,6 +1604,8 @@ export class BrowserManager {
 			session.browser.disconnect();
 			return;
 		}
+		if (session.disposed) return;
+		session.disposed = true;
 		if (session.dispose) {
 			await session.dispose();
 			return;
@@ -1551,7 +1623,9 @@ export class BrowserManager {
 			displayName: session.displayName,
 			engine: session.engine,
 			mode: session.mode,
-			profile: session.profile,
+			// A throwaway profile's name is its generated directory ID, which means nothing to a reader.
+			profile: session.temporary ? undefined : session.profile,
+			temporary: session.temporary,
 			adopted: session.adopted,
 			current: session.id === this.currentSessionId,
 			currentTabId: session.currentPageId,
@@ -1585,6 +1659,13 @@ export class BrowserManager {
 		if (!session) return;
 		this.rememberRemovedSession(session);
 		this.sessions.delete(sessionId);
+		// Closing the browser window is the ordinary way a session ends, and it arrives here through the
+		// disconnect event rather than through stop(). Teardown has to run on this path too, or a
+		// throwaway profile is left on disk until the next startup sweep. The flag keeps it to once.
+		if (session.mode === "launch" && !session.disposed) {
+			session.disposed = true;
+			void session.dispose?.().catch(() => undefined);
+		}
 		if (this.currentSessionId === sessionId) {
 			this.currentSessionId = this.sessions.keys().next().value;
 		}

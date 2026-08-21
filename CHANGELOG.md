@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Sessions are now throwaway by default: opening a browser asks nothing, and everything the session
+  signs in to is discarded when it closes. Because each one gets its own profile directory, several
+  browsers can now run at the same time.
+- `save_profile` keeps a throwaway session's signed-in state under a name you choose. It applies
+  immediately and the browser keeps running — nothing closes, restarts, or is copied. In the Browser
+  Manager it is `S`; `L` loads a browser on a saved profile.
+- Orphaned throwaway profiles left behind by a crash are swept on the next Pi session.
+- Closing a throwaway session now says what is about to be discarded, behind the existing confirm.
+- Screen control hints now wrap instead of being cut off. The Browser Manager's row had grown past
+  what a 120-column terminal could show, and because the hints run from routine to rare the first one
+  lost was `Esc back`.
+
+### Fixed
+
+- A migration that could never finish. A profile was treated as in use whenever a browser lock file
+  was present, but Firefox creates `parent.lock` once and never removes it — it holds the file open
+  exclusively while running instead. Any Firefox profile that had ever run therefore reported as open
+  forever, deferring its move and reporting "a browser still has them open" on every Pi start, with
+  no action a user could take to clear it. Lock files are now tested rather than counted: Windows asks
+  the OS whether the marker is actually held, and POSIX reads the pid out of the lock symlink so a
+  crashed browser's leftovers are recognised as stale.
+
+### Changed
+
+- **Breaking:** `browser start` without a `profile` now opens a throwaway session instead of using a
+  profile named `default`. Nothing it signs in to is kept, and each call opens a separate browser
+  rather than reusing an existing one. Pass `profile` to get the previous behaviour; a name that does
+  not exist yet is created on first use. Your existing `default` profile is untouched and still opens
+  with `profile: "default"`.
+- Profile names are stored verbatim rather than being sanitized into a directory name, so `My Work!`
+  stays `My Work!`. A profile's directory is named by a separate ID, recorded along with the name in a
+  `.pi-puppeteer-profile.json` file inside it. Existing profiles need no migration and are not moved.
+- `rename_profile` now works while a browser is running on the profile, because it no longer moves
+  anything on disk. `delete_profile` still requires the profile to be idle.
+
 ## [0.3.0] - 2026-08-20
 
 ### Security

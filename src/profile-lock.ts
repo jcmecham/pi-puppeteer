@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
@@ -128,67 +128,69 @@ export async function inspectProfile(userDataDir: string): Promise<ProfileState>
 	return { state: "free" };
 }
 
-export interface DiscoveredProfile {
-	browserKey: string;
-	profile: string;
-	path: string;
-	state: ProfileState["state"];
-	/** Set when a browser is live or starting on this profile. */
-	owner?: ProfileOwner;
-	browserURL?: string;
-	lastUsedAt?: number;
-}
-
-function directoryNames(root: string): string[] {
-	try {
-		return readdirSync(root, { withFileTypes: true })
-			.filter((entry) => entry.isDirectory())
-			.map((entry) => entry.name);
-	} catch {
-		return [];
-	}
-}
-
-function lastUsedAt(path: string): number | undefined {
-	try {
-		return statSync(path).mtimeMs;
-	} catch {
-		return undefined;
-	}
-}
+/** Files a browser leaves in a profile directory while it holds it. */
+const LOCK_MARKERS = ["SingletonLock", "SingletonCookie", "SingletonSocket", "lock", ".parentlock", "parent.lock"];
 
 /**
- * List every profile under a profile root along with whether a browser is currently running on it.
+ * Decide whether a browser currently holds a profile directory, from its lock files alone.
  *
- * Profiles are shared across projects, so "is this one in use?" can only be answered by looking at
- * the profile itself. Probes run concurrently: each one may wait on a network timeout, and a root
- * can hold a dozen profiles.
+ * Existence is not the answer, which is the trap this replaced. Firefox creates `parent.lock` once and
+ * never deletes it — it holds the file open exclusively while running — so testing for the file called
+ * every Firefox profile that had ever run "in use", permanently and with no action a user could take
+ * to clear it. Chromium's SingletonLock survives a crash to the same effect.
+ *
+ * What "held" means differs by platform, and so does the cost of guessing wrong:
+ *
+ * - Windows refuses to rename a directory a browser has open, so there the rename is the real guard
+ *   and this check only has to avoid crying wolf. Asking the OS to open the marker answers it exactly.
+ * - POSIX renames succeed no matter who holds the directory, so here this check is the only guard and
+ *   a wrong "free" silently breaks a running browser. A pid read out of a lock symlink settles most
+ *   cases; anything still unproven counts as in use.
+ *
+ * This answers a narrower question than `inspectProfile`, which needs a live debugging endpoint. Lock
+ * files are all a browser Pi did not launch leaves behind, and migration has to cope with those.
  */
-export async function discoverProfiles(profileRoot: string, browserKey?: string): Promise<DiscoveredProfile[]> {
-	const browserKeys = browserKey ? [browserKey] : directoryNames(profileRoot);
+export function browserHoldsProfile(profileDir: string): boolean {
+	return LOCK_MARKERS.some((marker) => markerIsHeld(join(profileDir, marker)));
+}
 
-	const candidates = browserKeys.flatMap((key) =>
-		directoryNames(join(profileRoot, key)).map((profile) => ({ browserKey: key, profile, path: join(profileRoot, key, profile) })),
-	);
+function markerIsHeld(markerPath: string): boolean {
+	let isSymbolicLink: boolean;
+	try {
+		isSymbolicLink = lstatSync(markerPath).isSymbolicLink();
+	} catch {
+		return false; // No marker at all: nothing has claimed this profile.
+	}
 
-	const discovered = await Promise.all(
-		candidates.map(async (candidate): Promise<DiscoveredProfile> => {
-			const state = await inspectProfile(candidate.path);
-			return {
-				...candidate,
-				state: state.state,
-				owner: state.state === "free" ? undefined : state.owner,
-				browserURL: state.state === "live" ? state.browserURL : undefined,
-				lastUsedAt: lastUsedAt(candidate.path),
-			};
-		}),
-	);
+	// Chromium points SingletonLock at "<hostname>-<pid>" and Firefox points lock at "<ip>:+<pid>".
+	// Both outlive a crash, so the pid inside them is what decides.
+	if (isSymbolicLink) {
+		let pid: number | undefined;
+		try {
+			pid = pidFromLockTarget(readlinkSync(markerPath));
+		} catch {
+			pid = undefined;
+		}
+		return pid === undefined ? process.platform !== "win32" : isProcessAlive(pid);
+	}
 
-	// Running profiles first, then most recently used, so the interesting entries lead.
-	return discovered.sort((left, right) => {
-		const liveDelta = Number(right.state !== "free") - Number(left.state !== "free");
-		return liveDelta !== 0 ? liveDelta : (right.lastUsedAt ?? 0) - (left.lastUsedAt ?? 0);
-	});
+	// A POSIX lock file is held with fcntl, which an ordinary open cannot detect. Unprovable means in
+	// use, because the rename that follows would not fail on our behalf.
+	if (process.platform !== "win32") return true;
+
+	try {
+		closeSync(openSync(markerPath, "r+"));
+		return false;
+	} catch (error) {
+		// ENOENT means it vanished between the stat and the open, so nothing is holding it.
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+}
+
+function pidFromLockTarget(target: string): number | undefined {
+	const match = /[-+](\d+)$/.exec(target);
+	const pid = match ? Number(match[1]) : Number.NaN;
+	return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 /** Wait out another process's in-flight launch rather than racing it into a forwarded no-op. */

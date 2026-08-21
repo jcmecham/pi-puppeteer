@@ -12,6 +12,7 @@ export type BrowserAction =
 	| "list_profiles"
 	| "rename_profile"
 	| "delete_profile"
+	| "save_profile"
 	| "start"
 	| "attach"
 	| "sessions"
@@ -159,7 +160,7 @@ export interface BrowserToolInput {
 	workflowId?: string;
 	workflowName?: string;
 	targetWorkflowName?: string;
-	/** New profile name for rename_profile. */
+	/** New profile name for rename_profile and save_profile. */
 	targetProfile?: string;
 	scriptFormat?: ScriptFormat;
 }
@@ -178,7 +179,10 @@ export interface SessionSummary {
 	displayName: string;
 	engine: BrowserEngine;
 	mode: SessionMode;
+	/** Display name of the profile in use; absent for throwaway and attached sessions. */
 	profile?: string;
+	/** True while the profile is throwaway and will be discarded when the session closes. */
+	temporary?: boolean;
 	/** True when this session connected to a browser another process already had open on the profile. */
 	adopted?: boolean;
 	current: boolean;
@@ -199,6 +203,10 @@ export interface BrowserSessionRecord {
 	engine: BrowserEngine;
 	mode: SessionMode;
 	profile?: string;
+	/** User data dir backing this session; absent for attached sessions. */
+	profileDir?: string;
+	/** Cleared by save_profile, which is what cancels the discard in dispose. */
+	temporary: boolean;
 	adopted?: boolean;
 	browser: Browser;
 	pages: Map<string, Page>;
@@ -208,6 +216,8 @@ export interface BrowserSessionRecord {
 	lastActiveAt: number;
 	// Teardown for launch-mode sessions; undefined for attach-mode sessions.
 	dispose?: () => Promise<void>;
+	/** Set once teardown has run, so closing the window and calling stop cannot both dispose. */
+	disposed?: boolean;
 }
 
 export interface RecordingRecord {

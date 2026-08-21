@@ -52,6 +52,15 @@ Suggested smoke-test flows before opening a PR or publishing:
 4. Run `inspect` or `extract_text`.
 5. Record and stop a short workflow or viewport recording.
 
+When touching profiles, also check the two halves of the throwaway/saved split, since neither is
+covered by `npm run verify` (it never launches a browser):
+
+6. `Alt+B`, then `N`. The browser opens with no picker and the row reads `temporary`. Close it and
+   confirm its directory under `~/.pi/agent/extensions/pi-puppeteer/profiles/` is gone.
+7. Open another, press `S`, and name it. The browser must **stay open and driveable**, and its
+   directory must not move — that is the property the sidecar exists to provide.
+8. Close it, then `L` and reopen it by name: the saved state should still be there.
+
 ## Code and docs expectations
 
 - Keep the public tool surface stable and clearly documented.
