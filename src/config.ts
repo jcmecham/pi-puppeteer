@@ -1,12 +1,29 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync } from "node:fs";
+import {
+	copyFileSync,
+	cpSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	rmdirSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import os from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative as relativePath, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { browserHoldsProfile } from "./profile-lock.ts";
 import type {
 	BrowserDefinition,
 	BrowserEngine,
 	ExtensionDefaults,
+	ProfileMigrationEntry,
+	ProfileMigrationReport,
+	ProfileScope,
 	RawBrowserDefinition,
 	RawExtensionConfig,
 	ResolvedConfig,
@@ -21,15 +38,23 @@ const DEFAULTS: ExtensionDefaults = {
 const BUILT_IN_DEFAULT_BROWSER = "chrome";
 const SYSTEM_DEFAULT_SETTING = "system";
 
+const GLOBAL_STORAGE_ROOT = join(getAgentDir(), "extensions", "pi-puppeteer");
 const DEFAULT_GLOBAL_CONFIG = join(getAgentDir(), "extensions", "pi-puppeteer.json");
 const LEGACY_PROJECT_CONFIGS = [".pi/pi-puppeteer.json", ".pi/.pi-puppeteer/pi-puppeteer.json"];
 const PROJECT_CONFIG = ".pi/.pi-puppeteer/settings.json";
 const LEGACY_STORAGE_ROOT = ".pi-puppeteer";
 const STORAGE_ROOT = ".pi/.pi-puppeteer";
-const LEGACY_PROFILE_ROOT = ".pi-puppeteer/profiles";
 const LEGACY_ARTIFACT_ROOT = ".pi-puppeteer/artifacts";
-const DEFAULT_PROFILE_ROOT = ".pi/.pi-puppeteer/profiles";
 const DEFAULT_ARTIFACT_ROOT = ".pi/.pi-puppeteer/artifacts";
+/** Profiles used to live here, per project. Both spellings are upgraded to the global root. */
+const LEGACY_PROFILE_ROOTS = [".pi-puppeteer/profiles", ".pi/.pi-puppeteer/profiles"];
+const PROJECT_PROFILE_ROOT = ".pi/.pi-puppeteer/profiles";
+const DEFAULT_GLOBAL_PROFILE_ROOT = join(GLOBAL_STORAGE_ROOT, "profiles");
+const PROFILE_MIGRATION_MARKER = ".pi/.pi-puppeteer/.profiles-migrated.json";
+const STORAGE_GITIGNORE = "*\n!.gitignore\n";
+
+/** Projects this process has already attempted to migrate, keyed by resolved cwd. */
+const migratedProjects = new Set<string>();
 
 function unique(values: Array<string | undefined>): string[] {
 	return [...new Set(values.filter((value): value is string => Boolean(value)))];
@@ -363,6 +388,23 @@ function resolveStorageRoot(cwd: string, value: string | undefined, legacyDefaul
 	return resolveMaybeRelative(cwd, shouldUseDefault ? nextDefault : value);
 }
 
+/**
+ * Resolve where named profiles live.
+ *
+ * An explicit `profileRoot` wins, except when it still spells one of the old project-local defaults —
+ * the README used to hand that exact value out as boilerplate, so treating it as a deliberate choice
+ * would leave most existing installs writing profiles into their repository. Those configs upgrade to
+ * the global root; `profileScope: "project"` is the way to opt back in.
+ */
+function resolveProfileRoot(cwd: string, value: string | undefined, scope: ProfileScope): string {
+	const isLegacyDefault =
+		value !== undefined && LEGACY_PROFILE_ROOTS.some((legacy) => normalizeConfigPath(value) === normalizeConfigPath(legacy));
+
+	if (value !== undefined && !isLegacyDefault) return resolveMaybeRelative(cwd, value);
+	if (scope === "project") return resolve(cwd, PROJECT_PROFILE_ROOT);
+	return DEFAULT_GLOBAL_PROFILE_ROOT;
+}
+
 function uniqueMigrationPath(path: string): string {
 	let candidate = `${path}.legacy`;
 	let counter = 1;
@@ -428,6 +470,189 @@ function moveStorageContents(source: string, target: string): void {
 	}
 }
 
+/**
+ * Create the project storage directory on demand and keep it out of the user's repository.
+ *
+ * Browser artifacts and workflow recordings are runtime state, and profiles used to land here too, so
+ * a stray `git add -A` could commit session cookies. Pi does the same for its own `.pi/npm` directory.
+ */
+export function ensureProjectStorage(cwd: string): string {
+	const storageRoot = join(cwd, STORAGE_ROOT);
+	mkdirSync(storageRoot, { recursive: true });
+	writeStorageGitignore(storageRoot);
+	return storageRoot;
+}
+
+function writeStorageGitignore(storageRoot: string): void {
+	const gitignorePath = join(storageRoot, ".gitignore");
+	if (existsSync(gitignorePath)) return;
+	try {
+		writeFileSync(gitignorePath, STORAGE_GITIGNORE, "utf8");
+	} catch {
+		// A read-only checkout is not a reason to fail a browser action.
+	}
+}
+
+/**
+ * Retrofit the ignore file into storage directories earlier versions already created, without
+ * creating one where none exists — starting Pi in a directory must leave no trace.
+ */
+function guardExistingProjectStorage(cwd: string): void {
+	const storageRoot = join(cwd, STORAGE_ROOT);
+	if (existsSync(storageRoot)) writeStorageGitignore(storageRoot);
+}
+
+function isInside(root: string, candidate: string): boolean {
+	const relative = relativePath(root, candidate);
+	return relative === "" || (!relative.startsWith("..") && !isAbsolute(relative));
+}
+
+/**
+ * Create the directory a runtime file is about to be written to, adding the self-protecting
+ * `.gitignore` whenever that file lands inside the project storage root. Directories are created here
+ * rather than at config load so that merely starting Pi in a directory leaves no trace.
+ */
+export function ensureStorageDir(cwd: string, targetDir: string): void {
+	if (isInside(join(cwd, STORAGE_ROOT), targetDir)) ensureProjectStorage(cwd);
+	mkdirSync(targetDir, { recursive: true });
+}
+
+function listDirectories(root: string): string[] {
+	try {
+		return readdirSync(root, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name);
+	} catch {
+		return [];
+	}
+}
+
+function readMigrationMarker(markerPath: string): ProfileMigrationReport | undefined {
+	if (!existsSync(markerPath)) return undefined;
+	try {
+		const parsed = JSON.parse(readFileSync(markerPath, "utf8")) as Partial<ProfileMigrationReport>;
+		return { moved: parsed.moved ?? [], pending: parsed.pending ?? [] };
+	} catch {
+		// A corrupt marker should not wedge migration; treat it as "not yet migrated".
+		return undefined;
+	}
+}
+
+/**
+ * Relocate one profile directory as a single unit.
+ *
+ * Profiles are never merged. `moveStorageContents` recursively merges directories and only renames
+ * conflicting files, which would interleave two Chromium profiles' `Cookies`, `Local State`, and
+ * IndexedDB and corrupt both. A profile either moves whole or stays where it is.
+ */
+function moveProfileDirectory(source: string, target: string): "moved" | "locked" | "failed" {
+	mkdirSync(dirname(target), { recursive: true });
+	try {
+		renameSync(source, target);
+		return "moved";
+	} catch (error) {
+		// Only a cross-volume move earns a copy fallback. EPERM/EBUSY/EACCES mean a browser still
+		// holds files open, and copying a profile out from under a live browser yields a corrupt
+		// copy — defer instead and retry on a later session.
+		if ((error as NodeJS.ErrnoException).code !== "EXDEV") return "locked";
+	}
+
+	// Stage the copy beside the target and swap it in with a rename, so a target directory never
+	// exists in a half-written state that a later run could mistake for a real profile.
+	const staging = uniqueMigrationPath(target);
+	try {
+		cpSync(source, staging, { recursive: true, errorOnExist: true, force: false });
+		renameSync(staging, target);
+	} catch {
+		try {
+			rmSync(staging, { recursive: true, force: true });
+		} catch {
+			// best effort
+		}
+		return "failed";
+	}
+
+	try {
+		rmSync(source, { recursive: true, force: true });
+	} catch {
+		// Locked leftovers stay behind; the copy at the target is authoritative.
+	}
+	return "moved";
+}
+
+/**
+ * Move legacy project-local profiles to the shared global profile root.
+ *
+ * Profiles are now keyed by name and shared across projects, so several projects can each hold a
+ * `chrome/default`. The first project to migrate wins; later collisions are reported and left in place
+ * rather than merged. Runs at most once per project — `loadConfig` is called many times per session.
+ */
+function migrateProfilesToGlobal(cwd: string, globalProfileRoot: string): ProfileMigrationReport | undefined {
+	// `loadConfig` runs on every command, not just at session start; the memo keeps migration to one
+	// attempt per project per process even when the on-disk checks below stay cheap.
+	const memoKey = resolve(cwd);
+	if (migratedProjects.has(memoKey)) return undefined;
+
+	const legacyRoot = join(cwd, PROJECT_PROFILE_ROOT);
+	if (!existsSync(legacyRoot)) return undefined;
+
+	const markerPath = join(cwd, PROFILE_MIGRATION_MARKER);
+	const marker = readMigrationMarker(markerPath);
+	if (marker && marker.pending.length === 0) return undefined;
+
+	// Claim before doing the work so a throw cannot turn into a retry storm.
+	migratedProjects.add(memoKey);
+
+	const moved: ProfileMigrationEntry[] = [];
+	const pending: ProfileMigrationEntry[] = [];
+
+	for (const browserKey of listDirectories(legacyRoot)) {
+		for (const profileName of listDirectories(join(legacyRoot, browserKey))) {
+			const source = join(legacyRoot, browserKey, profileName);
+			const target = join(globalProfileRoot, browserKey, profileName);
+
+			if (existsSync(target)) {
+				pending.push({ source, target, reason: "target-exists" });
+				continue;
+			}
+			if (browserHoldsProfile(source)) {
+				pending.push({ source, target, reason: "locked" });
+				continue;
+			}
+			const outcome = moveProfileDirectory(source, target);
+			if (outcome === "moved") moved.push({ source, target });
+			else pending.push({ source, target, reason: outcome });
+		}
+	}
+
+	if (moved.length === 0 && pending.length === 0) return undefined;
+
+	if (pending.length === 0) {
+		for (const browserKey of listDirectories(legacyRoot)) {
+			try {
+				rmdirSync(join(legacyRoot, browserKey));
+			} catch {
+				// Non-empty legacy folders stay put.
+			}
+		}
+		try {
+			rmdirSync(legacyRoot);
+		} catch {
+			// Non-empty legacy folders stay put.
+		}
+	}
+
+	const report: ProfileMigrationReport = { moved: [...(marker?.moved ?? []), ...moved], pending };
+	try {
+		mkdirSync(dirname(markerPath), { recursive: true });
+		writeFileSync(markerPath, `${JSON.stringify({ migratedAt: new Date().toISOString(), ...report }, null, 2)}\n`, "utf8");
+	} catch {
+		// Without a marker the next session simply re-checks; the moves themselves are idempotent.
+	}
+
+	return { moved, pending };
+}
+
 function migrateLegacyStorage(cwd: string): void {
 	const legacyRoot = join(cwd, LEGACY_STORAGE_ROOT);
 	if (!existsSync(legacyRoot)) return;
@@ -444,7 +669,6 @@ function migrateLegacyStorage(cwd: string): void {
 
 function migrateProjectConfig(cwd: string): void {
 	const projectConfigPath = join(cwd, PROJECT_CONFIG);
-	mkdirSync(dirname(projectConfigPath), { recursive: true });
 
 	for (const legacyConfig of LEGACY_PROJECT_CONFIGS) {
 		const legacyConfigPath = join(cwd, legacyConfig);
@@ -462,6 +686,7 @@ function migrateProjectConfig(cwd: string): void {
 export function loadConfig(cwd: string): ResolvedConfig {
 	migrateLegacyStorage(cwd);
 	migrateProjectConfig(cwd);
+	guardExistingProjectStorage(cwd);
 
 	const projectConfigPath = join(cwd, PROJECT_CONFIG);
 	const globalConfig = readJson(DEFAULT_GLOBAL_CONFIG);
@@ -502,13 +727,19 @@ export function loadConfig(cwd: string): ResolvedConfig {
 		? detectedSystemDefaultBrowser
 		: BUILT_IN_DEFAULT_BROWSER;
 	const defaultBrowser = defaultBrowserSetting === SYSTEM_DEFAULT_SETTING ? systemDefaultBrowser : defaultBrowserSetting;
-	const profileRoot = resolveStorageRoot(cwd, projectConfig.profileRoot ?? globalConfig.profileRoot, LEGACY_PROFILE_ROOT, DEFAULT_PROFILE_ROOT);
+	const profileScope: ProfileScope = projectConfig.profileScope ?? globalConfig.profileScope ?? "global";
+	const profileRoot = resolveProfileRoot(cwd, projectConfig.profileRoot ?? globalConfig.profileRoot, profileScope);
 	const artifactRoot = resolveStorageRoot(cwd, projectConfig.artifactRoot ?? globalConfig.artifactRoot, LEGACY_ARTIFACT_ROOT, DEFAULT_ARTIFACT_ROOT);
+
+	// Only relocate when profiles are actually leaving the project; a project-scoped install keeps them.
+	const profileMigration =
+		profileRoot === DEFAULT_GLOBAL_PROFILE_ROOT ? migrateProfilesToGlobal(cwd, profileRoot) : undefined;
 
 	return {
 		defaultBrowser,
 		defaultBrowserSetting,
 		systemDefaultBrowser,
+		profileScope,
 		profileRoot,
 		artifactRoot,
 		defaults: mergedDefaults,
@@ -517,5 +748,6 @@ export function loadConfig(cwd: string): ResolvedConfig {
 			global: DEFAULT_GLOBAL_CONFIG,
 			project: projectConfigPath,
 		},
+		profileMigration,
 	};
 }

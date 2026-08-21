@@ -133,7 +133,7 @@ Project config overrides global config.
 The config should support:
 
 - default browser key
-- profile root
+- profile scope (`global` or `project`) and an explicit profile root override
 - artifact root
 - default timeout / headless / waitUntil
 - browser definitions
@@ -145,14 +145,118 @@ The config should support:
 
 ## 4. Profile model
 
-Named profiles are stored on disk under a Pi-managed folder.
+Named profiles are stored on disk under a Pi-managed folder, outside any project directory.
 
 Example:
 
-- `.pi/.pi-puppeteer/profiles/chrome/default`
-- `.pi/.pi-puppeteer/profiles/edge/work`
+- `~/.pi/agent/extensions/pi-puppeteer/profiles/chrome/default`
+- `~/.pi/agent/extensions/pi-puppeteer/profiles/edge/work`
 
 This gives persistent login/session state without requiring the extension to reuse a user’s personal everyday browser profile.
+
+Profiles were project-local through 0.2.x. They moved for three reasons: a profile holds cookies and
+session tokens and so must never sit where `git add -A` can reach it; a single Chromium profile runs
+to hundreds of megabytes across thousands of cache files, duplicated per project; and a per-project
+profile forces a fresh sign-in for every repository.
+
+Profiles are keyed by name, not by project, so the same name means the same profile everywhere. The
+name is taken from the `profile` input. It is deliberately *not* derived from the session label —
+labels are auto-generated (`Browser-1`, `Browser-2`), so deriving from them would make unrelated
+projects collide by default.
+
+Set `profileScope: "project"` to restore the old layout.
+
+## 4bis. Persistence is opt-in
+
+Omitting `profile` gives a **throwaway** session: a fresh user data dir that is deleted when the
+session ends. This is the default because the common case does not want it any other way — most
+automation neither needs a signed-in profile nor wants one accumulating hundreds of megabytes of cache
+per run, and requiring an answer about persistence before a browser could open made the cheap case pay
+for the rare one.
+
+Two consequences fall out of it:
+
+- **Concurrency.** Chromium allows one process per `--user-data-dir`, so the old shared `default`
+  profile silently made a second browser impossible. A unique directory per launch removes that limit,
+  and `start` without a profile therefore never reuses or adopts: each call is a separate browser.
+- **Cleanup has to be certain.** A throwaway directory is removed when its session ends, on both exit
+  paths — `stop`, and the disconnect that arrives when the user closes the window. A crash skips both,
+  so `session_start` sweeps any throwaway directory no live browser holds. The sidecar below is what
+  makes that judgement safe rather than a guess about directory names.
+
+## 4c. Profile identity lives in a sidecar
+
+A profile's identity used to be its directory name: `profiles/chrome/work` *was* the profile "work".
+That made "keep this running session" impossible without closing the browser, because renaming meant
+moving a live `--user-data-dir`:
+
+- Windows refuses the rename with `EPERM`/`EBUSY` while Chromium holds handles inside the directory.
+- POSIX lets it succeed, and then Chromium cannot create new files at the old path it still has cached.
+- Copying instead is worse: the `Cookies` and `Local State` SQLite databases can be caught
+  mid-transaction, and the corruption is silent until the profile is next opened.
+
+So the directory name is now an opaque ID and the display name lives in `.pi-puppeteer-profile.json`
+inside the directory, beside `.pi-puppeteer-owner.json`. Saving a throwaway session, or renaming a
+saved profile, is one small JSON write: nothing moves and the running browser never notices. Deleting
+still requires an idle profile, because removing a live directory genuinely does break the browser
+holding it.
+
+The rules that matter:
+
+- **Nothing is ever renamed on disk.** A saved profile's ID is derived from its name so paths stay
+  readable, but it is fixed at creation. After a rename the ID and the display name can differ; that is
+  the price of never touching a live directory, and it is deliberate.
+- **No migration.** A directory with no sidecar is a profile whose ID happens to equal its name — which
+  is exactly what every pre-0.4 directory is. The sidecar is written lazily on first discovery, and the
+  directory keeps its name.
+- **Names are stored verbatim.** Only the ID is sanitized, so a profile can be called `My Work!`
+  without that reaching a path. A traversal in a display name is inert for the same reason.
+- **Throwaway IDs carry a `tmp-` prefix**, so the sweep can still recognise one whose sidecar was lost.
+
+## 4a. Storage layout and migration
+
+Two roots, split by what the data is:
+
+- **project** — `<cwd>/.pi/.pi-puppeteer/`: `settings.json`, `artifacts/`, `workflows/`. Created
+  lazily, on first write, and carries a `.gitignore` of `*` / `!.gitignore`.
+- **global** — `<agentDir>/extensions/pi-puppeteer/`: `profiles/`.
+
+Legacy project profiles migrate on the first `loadConfig` that resolves to the global root, memoized
+per project for the process lifetime. The rules that matter:
+
+- **Never merge.** A profile is moved whole with `renameSync`, or not at all. Two same-named profiles
+  from different projects would otherwise interleave their `Cookies`, `Local State`, `Preferences`,
+  and IndexedDB and corrupt both. First project to migrate wins; the rest are reported and left.
+- **Only `EXDEV` earns a copy.** `EPERM`/`EBUSY`/`EACCES` mean a browser holds the profile open, so
+  migration defers and retries on a later session rather than copying live files.
+- **Cross-volume copies stage and swap.** The copy lands beside the target and is renamed into place,
+  so a target directory never exists half-written.
+
+## 4b. Profile ownership across processes
+
+Chromium allows one browser process per `--user-data-dir`; a second launch forwards its command line
+to the running instance and exits. With profiles shared across projects, two Pi sessions can want the
+same profile, so a session records ownership inside the user data dir (`.pi-puppeteer-owner.json`:
+pid, host, state, DevTools URL).
+
+- A session finding a live owner **adopts** that browser: it connects, and on teardown disconnects
+  rather than closing or reaping.
+- Liveness is always confirmed by a real request to the DevTools endpoint. A pid alone is not enough,
+  because Windows recycles pids.
+- Process reaping sweeps by user data dir **only** while this process owns the profile, and matches
+  the whole `--user-data-dir` argument — a prefix match would let `.../default` reap `.../default-2`.
+
+Ownership is also readable ahead of time. `discoverProfiles` walks the profile root and resolves each
+entry to free, starting, or live, probing candidates concurrently because each probe can wait on a
+network timeout. It backs the `list_profiles` action and the Browser Manager’s profile picker, so a
+contended profile is a visible choice rather than a surprise at launch.
+
+Deleting a profile goes through the same liveness check and refuses while a browser holds the profile,
+whether that is a session in this process or a Pi session in another project, because removing a live
+user data dir corrupts it. Renaming does not need the check: since §4c it changes only the sidecar.
+
+Detection sees only browsers exposing a debugging endpoint. That covers everything Pi launches; a
+browser the user started themselves on the same profile is invisible to it and will collide at launch.
 
 ## 5. Session model
 
@@ -164,6 +268,7 @@ Each session tracks:
 - engine
 - connection mode (`launch` or `attach`)
 - profile name when relevant
+- whether the browser was adopted from another process, which decides between disconnect and close on teardown
 - current tab ID
 - tab map
 
@@ -227,6 +332,9 @@ This keeps normal Pi tool actions and manual headed-browser interactions in the 
 - OS-level browser chrome/window recording (current recording captures the page viewport)
 - remote/cloud browser providers
 - login/session import from personal browser profiles
+- recovering a throwaway session's data after it has closed
+- merging two same-named browser profiles from different projects
+- per-project isolation of a shared profile (use a distinct `profile` name instead)
 
 ## 9. Firefox plan
 

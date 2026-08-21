@@ -9,6 +9,10 @@ export type ScriptFormat = "puppeteer" | "browser_tool";
 
 export type BrowserAction =
 	| "list_browsers"
+	| "list_profiles"
+	| "rename_profile"
+	| "delete_profile"
+	| "save_profile"
 	| "start"
 	| "attach"
 	| "sessions"
@@ -70,12 +74,33 @@ export interface ExtensionDefaults {
 	navigationWaitUntil: NavigationWaitUntil;
 }
 
+export type ProfileScope = "global" | "project";
+
 export interface RawExtensionConfig {
 	defaultBrowser?: string;
+	/**
+	 * Where named browser profiles live. "global" (the default) shares them across projects under the
+	 * Pi agent directory; "project" keeps them in `<cwd>/.pi/.pi-puppeteer/profiles`. An explicit
+	 * `profileRoot` overrides this.
+	 */
+	profileScope?: ProfileScope;
 	profileRoot?: string;
 	artifactRoot?: string;
 	defaults?: Partial<ExtensionDefaults>;
 	browsers?: Record<string, RawBrowserDefinition>;
+}
+
+/** One profile directory the migration relocated, or could not relocate yet. */
+export interface ProfileMigrationEntry {
+	source: string;
+	target: string;
+	reason?: "target-exists" | "locked" | "failed";
+}
+
+/** Result of relocating legacy project-local profiles to the global profile root. */
+export interface ProfileMigrationReport {
+	moved: ProfileMigrationEntry[];
+	pending: ProfileMigrationEntry[];
 }
 
 export interface ResolvedConfig {
@@ -85,6 +110,8 @@ export interface ResolvedConfig {
 	defaultBrowserSetting: string;
 	/** Detected OS default browser key, or the built-in fallback when detection is unsupported. */
 	systemDefaultBrowser: string;
+	/** Resolved profile scope after config precedence. */
+	profileScope: ProfileScope;
 	profileRoot: string;
 	artifactRoot: string;
 	defaults: ExtensionDefaults;
@@ -93,6 +120,8 @@ export interface ResolvedConfig {
 		global: string;
 		project: string;
 	};
+	/** Populated only on the first `loadConfig` of a session that actually relocated profiles. */
+	profileMigration?: ProfileMigrationReport;
 }
 
 export interface BrowserToolInput {
@@ -131,6 +160,8 @@ export interface BrowserToolInput {
 	workflowId?: string;
 	workflowName?: string;
 	targetWorkflowName?: string;
+	/** New profile name for rename_profile and save_profile. */
+	targetProfile?: string;
 	scriptFormat?: ScriptFormat;
 }
 
@@ -148,7 +179,12 @@ export interface SessionSummary {
 	displayName: string;
 	engine: BrowserEngine;
 	mode: SessionMode;
+	/** Display name of the profile in use; absent for throwaway and attached sessions. */
 	profile?: string;
+	/** True while the profile is throwaway and will be discarded when the session closes. */
+	temporary?: boolean;
+	/** True when this session connected to a browser another process already had open on the profile. */
+	adopted?: boolean;
 	current: boolean;
 	currentTabId?: string;
 	tabCount: number;
@@ -167,6 +203,11 @@ export interface BrowserSessionRecord {
 	engine: BrowserEngine;
 	mode: SessionMode;
 	profile?: string;
+	/** User data dir backing this session; absent for attached sessions. */
+	profileDir?: string;
+	/** Cleared by save_profile, which is what cancels the discard in dispose. */
+	temporary: boolean;
+	adopted?: boolean;
 	browser: Browser;
 	pages: Map<string, Page>;
 	currentPageId?: string;
@@ -175,6 +216,8 @@ export interface BrowserSessionRecord {
 	lastActiveAt: number;
 	// Teardown for launch-mode sessions; undefined for attach-mode sessions.
 	dispose?: () => Promise<void>;
+	/** Set once teardown has run, so closing the window and calling stop cannot both dispose. */
+	disposed?: boolean;
 }
 
 export interface RecordingRecord {
