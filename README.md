@@ -34,9 +34,11 @@ Use it to ask Pi to:
 
 - Node.js `>=22`
 - Pi with package/extension support
-- A Chromium-family browser installed
+- A Chromium-family browser or Firefox installed
 
 Current Chromium-family support includes Chrome, Edge, Brave, Opera, Vivaldi, and Yandex Browser.
+Firefox is supported too, over WebDriver BiDi rather than CDP. Everything the `browser` tool does
+works on both; the handful of places Firefox behaves differently are in [Firefox](#firefox) below.
 
 ## Quick examples
 
@@ -44,6 +46,7 @@ After installation, you can ask Pi things like:
 
 - “Start Chrome named `Docs` and open example.com.”
 - “Attach to my running Edge debugging endpoint on port 9222.”
+- “Start Firefox on the `work` profile and open my dashboard.”
 - “Click the sign in button in the current browser session.”
 - “Inspect this page and summarize the headings, forms, and links.”
 - “Take a full-page screenshot and save it as `artifacts/home.png`.”
@@ -170,6 +173,40 @@ a live profile directory cannot be removed without corrupting the browser holdin
 browser first, even if it was started by Pi in another project. Deleting a profile permanently
 discards everything it holds, including the sites it was signed in to.
 
+### Firefox
+
+Firefox works like any other browser here — `browserKey: "firefox"`, the same profiles, the same
+actions — but it speaks WebDriver BiDi instead of CDP, and three consequences are worth knowing
+before you hit them.
+
+**One automation session per browser.** Firefox permits exactly one WebDriver session per process
+([Bug 1720707](https://bugzilla.mozilla.org/show_bug.cgi?id=1720707)). Two Pi sessions in two
+projects can share one Chrome window; they cannot share one Firefox window. The second one is told
+so by name, and told which project is holding it, rather than failing obscurely. Pass a different
+`profile` to get a separate window.
+
+A Firefox that Pi disconnected from cleanly *can* be picked up again later — that is what adoption
+means here, and it is also how you attach to a Firefox you started yourself. A Pi process that was
+killed outright is the exception: Firefox never learns the session ended and cannot hand it back, so
+that window has to be closed.
+
+**Pi writes a few preferences into the profile.** They live in a marked block in `user.js`, and
+anything you have set yourself outside that block is left alone:
+
+- `fission.webContentIsolationStrategy` — without it, clicks do not reach cross-origin iframes.
+- `browser.aboutwelcome.enabled`, `browser.startup.page`, `browser.startup.homepage` — so a session's
+  first tab is the page you asked for and not an onboarding tour or last week's restored tabs.
+- `signon.rememberSignons` and `signon.autofillForms`, on saved profiles only — Firefox switches both
+  off by itself whenever a debugging port is passed, which would quietly stop a profile whose whole
+  job is staying signed in from ever saving a password.
+
+That list is deliberately short. Firefox applies its own, much longer set of automation preferences
+at startup and clears them again when it exits, so writing them here would only make them permanent.
+
+**`inspect` has no accessibility snapshot** on Firefox, and `emulate` has no `isMobile`: the viewport,
+scale, and user agent are applied, but layout that keys off that flag alone is unchanged. Turning
+touch emulation on or off reloads the tab.
+
 ## Screenshots and recordings
 
 Screenshots and recordings are saved under the project artifact directory by default:
@@ -249,15 +286,21 @@ against the project directory rather than the artifact root.
 - Sessions are throwaway unless you name a profile. Nothing a throwaway session signs in to survives
   it closing, and every launch without a profile opens a separate browser.
 - Browser launches are headed by default. Pass `headless: true` when you want a headless session.
-- Attach mode requires the target Chromium browser to be running with remote debugging enabled.
+- Attach mode requires the target browser to be running with remote debugging enabled: a Chromium
+  browser started with `--remote-debugging-port=9222`, or Firefox started the same way — for Firefox
+  the endpoint is `ws://127.0.0.1:9222/session`, and the `http://` spelling of the same address is
+  accepted too.
 - Attached browsers are disconnected, not forcibly closed, when Pi shuts down.
 - Launch-created browser sessions are closed when Pi shuts down.
 - Only one browser can run per profile. Starting a session on a profile another Pi session already
   has open adopts that browser instead of launching a second one; an adopted browser stays open when
-  the adopting session ends. Pass a different `profile` when you want a separate window.
+  the adopting session ends. Pass a different `profile` when you want a separate window. Firefox can
+  only be adopted while nothing else is driving it — see [Firefox](#firefox).
 - A browser running on a profile is only detectable if it exposes a debugging endpoint, which is the
   case for anything Pi launched. A browser you started yourself, outside Pi, on the same profile will
-  not be reported as in use.
+  not be reported as in use. Firefox is the exception: Pi checks its profile lock before launching,
+  so starting a session on a profile your own Firefox has open fails with an explanation rather than
+  colliding.
 
 ## Upgrading from 0.2.x
 

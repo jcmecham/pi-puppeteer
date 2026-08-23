@@ -250,7 +250,12 @@ export interface DiscoveredProfile {
 	state: ProfileState["state"];
 	/** Set when a browser is live or starting on this profile. */
 	owner?: ProfileOwner;
+	/** Set for a live Chromium profile. */
 	browserURL?: string;
+	/** Set for a live Firefox profile, which has no HTTP endpoint to report. */
+	browserWSEndpoint?: string;
+	/** Firefox only: false when its one WebDriver session is already attached. */
+	sessionAvailable?: boolean;
 	lastUsedAt?: number;
 }
 
@@ -297,7 +302,9 @@ export async function discoverProfiles(
 				...candidate,
 				state: state.state,
 				owner: state.state === "free" ? undefined : state.owner,
-				browserURL: state.state === "live" ? state.browserURL : undefined,
+				browserURL: state.state === "live" && state.engine === "chromium" ? state.browserURL : undefined,
+				browserWSEndpoint: state.state === "live" && state.engine === "firefox" ? state.browserWSEndpoint : undefined,
+				sessionAvailable: state.state === "live" && state.engine === "firefox" ? state.sessionAvailable : undefined,
 				lastUsedAt: lastUsedAt(candidate.path),
 			};
 		}),

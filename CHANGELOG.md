@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Firefox is a real engine now rather than a reserved seat. It launches on named and throwaway
+  profiles, attaches to a Firefox you started yourself, adopts one an earlier Pi session left
+  running, and does everything the Chromium engines do — navigate, click, type, inspect, screenshot,
+  record, and record and replay workflows. What differs is that Firefox allows exactly one automation
+  session per browser, so two Pi sessions cannot share one window the way two can share Chrome. The
+  second one is told which project is holding it, by name, instead of failing obscurely.
+- Pi writes six preferences into a marked block in a Firefox profile's `user.js` and leaves the
+  rest of the file alone. Puppeteer's own Firefox support writes about sixty, one of which switches
+  the password manager off — reasonable for a test harness, wrong for a profile whose entire job is
+  staying signed in, and permanent, because a `user.js` value outlives the file it came from.
+- Starting a session on a profile your own Firefox already has open now fails in under a second with
+  an explanation. Firefox answers a second process on one profile with a modal dialog, so without
+  this the launch sat behind it until it timed out.
+- Attach defaults are per engine. `attach` with no endpoint now reaches `ws://127.0.0.1:9222/session`
+  for Firefox instead of a Chromium DevTools URL that could never have answered — Firefox 152 serves
+  no HTTP debugging endpoint at all.
 - Sessions are now throwaway by default: opening a browser asks nothing, and everything the session
   signs in to is discarded when it closes. Because each one gets its own profile directory, several
   browsers can now run at the same time.
@@ -22,6 +38,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A running Firefox profile reported as free, so the startup sweep could delete a throwaway profile
+  directory out from under the browser still writing to it, and `delete_profile` would remove a
+  profile a browser was holding. "Is anything using this?" was answered by asking for a Chromium
+  DevTools port, which Firefox does not write. Firefox advertises a WebSocket endpoint in
+  `WebDriverBiDiServer.json` instead, and Pi now reads it — and confirms it with a real request, the
+  same way it confirms a DevTools port.
+- `emulate` claimed in a comment to run over CDP whichever browser it was talking to. On Firefox it
+  runs over WebDriver BiDi, and it now says what Firefox does not do — there is no `isMobile`
+  equivalent, and changing touch emulation reloads the tab — rather than quietly not doing it.
 - A migration that could never finish. A profile was treated as in use whenever a browser lock file
   was present, but Firefox creates `parent.lock` once and never removes it — it holds the file open
   exclusively while running instead. Any Firefox profile that had ever run therefore reported as open
@@ -35,6 +60,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Internal: a live profile's ownership record names the engine that holds it, so an endpoint can
+  never be handed to the wrong protocol. Records written by earlier versions still read correctly.
+  No configuration changes.
 - **Breaking:** `browser start` without a `profile` now opens a throwaway session instead of using a
   profile named `default`. Nothing it signs in to is kept, and each call opens a separate browser
   rather than reusing an existing one. Pass `profile` to get the previous behaviour; a name that does

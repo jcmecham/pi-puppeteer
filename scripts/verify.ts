@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -304,6 +304,183 @@ console.log("\nprofile lock detection");
 	}
 }
 
+console.log("\nfirefox endpoint normalization");
+
+{
+	const { normalizeFirefoxEndpoint } = await import("../src/adapters/firefox.ts");
+
+	const rows: Array<[string, string]> = [
+		["ws://127.0.0.1:9222", "ws://127.0.0.1:9222/session"],
+		["ws://127.0.0.1:9222/", "ws://127.0.0.1:9222/session"],
+		["ws://127.0.0.1:9222/session", "ws://127.0.0.1:9222/session"],
+		["wss://example.test:9222/session", "wss://example.test:9222/session"],
+		// The row that matters: --remote-debugging-port reads like an HTTP thing, and every other
+		// browser in the config is attached to over http://, so this is the likeliest thing to type.
+		["http://127.0.0.1:9222", "ws://127.0.0.1:9222/session"],
+		["https://example.test:9222", "wss://example.test:9222/session"],
+		// A session-scoped path is passed through untouched rather than rewritten: rewriting it would
+		// connect somewhere other than where the caller pointed.
+		["ws://127.0.0.1:9222/session/abc-123", "ws://127.0.0.1:9222/session/abc-123"],
+	];
+
+	for (const [input, expected] of rows) {
+		const actual = normalizeFirefoxEndpoint(input);
+		check(`${input} normalizes to ${expected}`, actual === expected, actual);
+		check(`${input} normalizes idempotently`, normalizeFirefoxEndpoint(actual) === actual, normalizeFirefoxEndpoint(actual));
+	}
+
+	let message = "";
+	try {
+		normalizeFirefoxEndpoint("127.0.0.1:9222");
+	} catch (error) {
+		message = (error as Error).message;
+	}
+	check("an unparseable endpoint is refused", message.includes("ws://host:port/session") && message.includes("http://host:port"), message);
+}
+
+console.log("\nfirefox profile preferences");
+
+{
+	const { ensureFirefoxPrefs, mergeFirefoxPrefs, renderFirefoxPrefs, PREF_BLOCK_BEGIN } = await import(
+		"../src/adapters/firefox-profile.ts"
+	);
+
+	const saved = renderFirefoxPrefs({ temporary: false });
+	const throwaway = renderFirefoxPrefs({ temporary: true });
+
+	check("the required fission pref is written for both", saved.includes('"fission.webContentIsolationStrategy", 0') && throwaway.includes('"fission.webContentIsolationStrategy", 0'));
+	// Firefox turns the password manager off by itself whenever a debugging port is passed. A saved
+	// profile exists to stay signed in, so it has to be turned back on; a throwaway one does not.
+	check("a saved profile keeps its password manager", saved.includes('"signon.rememberSignons", true'));
+	check("a throwaway profile keeps Firefox's hygiene", !throwaway.includes("signon.rememberSignons"));
+
+	const prefLines = saved.split("\n").filter((line) => line.trim() && !line.startsWith("//"));
+	check("every written line is a well-formed user_pref", prefLines.every((line) => /^user_pref\("[^"]+", .+\);$/.test(line)), prefLines.join(" | "));
+
+	// The regression guard for the whole reason this file exists. puppeteer's createProfile writes
+	// roughly sixty preferences, and a user.js value persists in prefs.js forever — so one launch
+	// through puppeteer.launch would permanently damage a profile the user signs in with.
+	for (const forbidden of ["dummy.test", "services.settings.server", "network.sntp.pools", "remote.prefs.recommended"]) {
+		check(`the managed block never writes ${forbidden}`, !saved.includes(forbidden) && !throwaway.includes(forbidden));
+	}
+
+	check("merging into an empty file yields the block", mergeFirefoxPrefs("", saved) === saved);
+	check("merging is idempotent", mergeFirefoxPrefs(mergeFirefoxPrefs("", saved), saved) === mergeFirefoxPrefs("", saved));
+
+	const withMine = mergeFirefoxPrefs('user_pref("mine", 1);\n', saved);
+	check("a hand-written pref outside the block survives", withMine.includes('user_pref("mine", 1);') && withMine.includes("fission.webContentIsolationStrategy"));
+
+	// A stale block must be replaced, not stacked: a profile relaunched a hundred times would
+	// otherwise accumulate a hundred copies.
+	const replaced = mergeFirefoxPrefs(withMine, throwaway);
+	check("a stale block is replaced rather than duplicated", replaced.split(PREF_BLOCK_BEGIN).length - 1 === 1, String(replaced.split(PREF_BLOCK_BEGIN).length - 1));
+	check("the replacement drops the prefs it no longer wants", !replaced.includes("signon.rememberSignons") && replaced.includes('user_pref("mine", 1);'));
+
+	const prefsDir = join(ROOT, "firefox-prefs");
+	mkdirSync(prefsDir, { recursive: true });
+	ensureFirefoxPrefs(prefsDir, { temporary: false });
+	const firstPass = readFileSync(join(prefsDir, "user.js"), "utf8");
+	const firstMtime = statSync(join(prefsDir, "user.js")).mtimeMs;
+	ensureFirefoxPrefs(prefsDir, { temporary: false });
+	check("reprovisioning writes identical content", readFileSync(join(prefsDir, "user.js"), "utf8") === firstPass);
+	// profile-store orders the picker by mtime, so rewriting an unchanged file would make every
+	// profile look freshly used on every launch.
+	check("reprovisioning leaves mtime alone", statSync(join(prefsDir, "user.js")).mtimeMs === firstMtime);
+}
+
+console.log("\nfirefox profile liveness");
+
+{
+	const { inspectProfile, parseBidiStatus, readBidiEndpoint } = await import("../src/profile-lock.ts");
+
+	check("a ready remote agent is reachable and adoptable", JSON.stringify(parseBidiStatus({ result: { ready: true } })) === JSON.stringify({ reachable: true, sessionAvailable: true }));
+	// Firefox permits one WebDriver session per browser process (Bug 1720707). ready:false means the
+	// session is taken, not that the browser is unwell — the difference between adopting and erroring.
+	check("a taken session is reachable but not adoptable", JSON.stringify(parseBidiStatus({ result: { ready: false, message: "Session already started" } })) === JSON.stringify({ reachable: true, sessionAvailable: false }));
+	check("an error reply is not a status", parseBidiStatus({ error: "unknown command", id: 1 }) === undefined);
+	check("a non-object payload is not a status", parseBidiStatus("nope") === undefined);
+
+	const liveRoot = join(ROOT, "firefox-live");
+	const fxDir = (name: string): string => {
+		const path = join(liveRoot, name);
+		mkdirSync(path, { recursive: true });
+		return path;
+	};
+
+	const endpointDir = fxDir("endpoint");
+	writeFileSync(join(endpointDir, "WebDriverBiDiServer.json"), JSON.stringify({ ws_host: "127.0.0.1", ws_port: 4242 }), "utf8");
+	check("the advertised endpoint is read back", readBidiEndpoint(endpointDir)?.url === "ws://127.0.0.1:4242", JSON.stringify(readBidiEndpoint(endpointDir)));
+	writeFileSync(join(fxDir("malformed"), "WebDriverBiDiServer.json"), "{not json", "utf8");
+	check("a malformed endpoint file is ignored", readBidiEndpoint(join(liveRoot, "malformed")) === undefined);
+	check("a missing endpoint file is ignored", readBidiEndpoint(fxDir("no-endpoint")) === undefined);
+
+	// The Firefox counterpart of "an unreachable DevTools port reads as free": port 1 is privileged
+	// and nothing answers there, so the file is a leftover from a browser that is gone.
+	const deadDir = fxDir("dead-port");
+	writeFileSync(join(deadDir, "WebDriverBiDiServer.json"), JSON.stringify({ ws_host: "127.0.0.1", ws_port: 1 }), "utf8");
+	check("an unreachable BiDi endpoint reads as free", (await inspectProfile(deadDir)).state === "free");
+
+	const staleOwner = fxDir("stale-owner");
+	writeFileSync(
+		join(staleOwner, ".pi-puppeteer-owner.json"),
+		JSON.stringify({ pid: 1, browserURL: "", browserWSEndpoint: "ws://127.0.0.1:1", engine: "firefox", browserKey: "firefox", profile: "work", cwd: staleOwner, startedAt: 0, host: "not-this-host", state: "ready" }),
+		"utf8",
+	);
+	check("a stale Firefox ownership record reads as free", (await inspectProfile(staleOwner)).state === "free");
+	check("the stale Firefox record is cleaned up", !existsSync(join(staleOwner, ".pi-puppeteer-owner.json")));
+
+	const startingDir = fxDir("starting");
+	writeFileSync(
+		join(startingDir, ".pi-puppeteer-owner.json"),
+		JSON.stringify({ pid: process.pid, browserURL: "", browserWSEndpoint: "", engine: "firefox", browserKey: "firefox", profile: "work", cwd: startingDir, startedAt: Date.now(), host: hostname(), state: "starting" }),
+		"utf8",
+	);
+	const starting = await inspectProfile(startingDir);
+	check("a Firefox claim inside the grace period reads as starting", starting.state === "starting", starting.state);
+
+	// The zero-blast-radius claim, asserted rather than hoped for. A record written before the engine
+	// field existed is a Chromium record, and a DevTools port must still be probed over HTTP.
+	const legacyDir = fxDir("legacy-chromium");
+	writeFileSync(
+		join(legacyDir, ".pi-puppeteer-owner.json"),
+		JSON.stringify({ pid: process.pid, browserURL: "http://127.0.0.1:1", browserKey: "chrome", profile: "work", cwd: legacyDir, startedAt: 0, host: hostname(), state: "ready" }),
+		"utf8",
+	);
+	check("a record with no engine field still takes the Chromium path", (await inspectProfile(legacyDir)).state === "free");
+	const portOnly = fxDir("port-only");
+	writeFileSync(join(portOnly, "DevToolsActivePort"), "1\n/devtools/browser/x", "utf8");
+	check("a DevToolsActivePort-only profile is unchanged", (await inspectProfile(portOnly)).state === "free");
+}
+
+console.log("\nattach endpoints");
+
+{
+	const { defaultAttachEndpoint, resolveAttachEndpoint } = await import("../src/config.ts");
+
+	check("the Firefox default is a WebSocket endpoint", defaultAttachEndpoint("firefox") === "ws://127.0.0.1:9222/session", defaultAttachEndpoint("firefox"));
+	check("the Chromium default is unchanged", defaultAttachEndpoint("chromium") === "http://127.0.0.1:9222", defaultAttachEndpoint("chromium"));
+
+	const config = loadConfig(project("attach-defaults"));
+	check("the built-in firefox entry carries a ws endpoint", config.browsers.firefox?.attach?.browserWSEndpoint === "ws://127.0.0.1:9222/session", JSON.stringify(config.browsers.firefox?.attach));
+	check("the built-in chrome entry is untouched", config.browsers.chrome?.attach?.browserURL === "http://127.0.0.1:9222", JSON.stringify(config.browsers.chrome?.attach));
+
+	const firefoxDefinition = config.browsers.firefox;
+	if (!firefoxDefinition) throw new Error("the firefox definition is missing");
+	check("an explicit endpoint wins", resolveAttachEndpoint(firefoxDefinition, "ws://elsewhere:1/session") === "ws://elsewhere:1/session");
+	check("a configured ws endpoint is next", resolveAttachEndpoint(firefoxDefinition) === "ws://127.0.0.1:9222/session");
+	check(
+		"a configured http endpoint is used when there is no ws one",
+		resolveAttachEndpoint({ ...firefoxDefinition, attach: { browserURL: "http://127.0.0.1:1234" } }) === "http://127.0.0.1:1234",
+	);
+	// The hole this closes: a browser defined in user config with engine "firefox" and no attach block
+	// used to fall through to the Chromium URL, which Firefox 152 could never have answered.
+	check(
+		"a Firefox browser with no attach block falls back per engine",
+		resolveAttachEndpoint({ ...firefoxDefinition, attach: undefined }) === "ws://127.0.0.1:9222/session",
+		resolveAttachEndpoint({ ...firefoxDefinition, attach: undefined }),
+	);
+}
+
 console.log("\ntemporary profiles");
 
 {
@@ -378,8 +555,16 @@ console.log("\ntemporary profiles");
 		JSON.stringify({ pid: process.pid, browserURL: "", browserKey: "vivaldi", profile: claimed.meta.id, cwd: root, startedAt: Date.now(), host: hostname(), state: "starting" }),
 		"utf8",
 	);
+	// A Firefox throwaway whose owner record was lost to a crash. Its endpoint file names a port
+	// nothing answers on, so the browser is genuinely gone and the directory is the sweep's to take.
+	// The live counterpart of this is a real-browser test: see the Firefox notes in the README.
+	const firefoxOrphan = allocateTemporaryProfile(root, "firefox");
+	mkdirSync(firefoxOrphan.dir, { recursive: true });
+	writeFileSync(join(firefoxOrphan.dir, "WebDriverBiDiServer.json"), JSON.stringify({ ws_host: "127.0.0.1", ws_port: 1 }), "utf8");
+
 	await sweepTemporaryProfiles(root);
 	check("the sweep removes an abandoned throwaway profile", !existsSync(orphan.dir));
+	check("the sweep removes one whose Firefox endpoint is dead", !existsSync(firefoxOrphan.dir));
 	check("the sweep leaves one a browser is still starting on", existsSync(claimed.dir));
 	check("the sweep never touches a saved profile", existsSync(first.dir) && existsSync(legacyDir) && existsSync(alpha.dir));
 }

@@ -341,10 +341,38 @@ function defaultBrowserDefinitions(): Record<string, BrowserDefinition> {
 			displayName: "Firefox",
 			engine: "firefox",
 			launchArgs: [],
+			attach: { browserWSEndpoint: defaultAttachEndpoint("firefox") },
 			discovered: false,
 			discoveryCandidates: browserCandidates("firefox", "firefox"),
 		},
 	};
+}
+
+/**
+ * Where `attach` looks when nothing was configured or requested.
+ *
+ * 9222 is not a Chromium-ism carried over: it is also Firefox's own `DEFAULT_PORT` for the remote
+ * agent. What differs is the protocol — Firefox 152 serves no HTTP debugging endpoint at all, so a
+ * `http://` default could never have answered.
+ */
+export function defaultAttachEndpoint(engine: BrowserEngine): string {
+	return engine === "firefox" ? "ws://127.0.0.1:9222/session" : "http://127.0.0.1:9222";
+}
+
+/**
+ * Resolve the endpoint an attach should use: what was asked for, then what the browser configures,
+ * then the engine's default.
+ *
+ * Folded into one function so a browser defined in user config with `engine: "firefox"` and no
+ * `attach` block cannot fall through to a Chromium URL.
+ */
+export function resolveAttachEndpoint(definition: BrowserDefinition, requested?: string): string {
+	return (
+		requested ??
+		definition.attach?.browserWSEndpoint ??
+		definition.attach?.browserURL ??
+		defaultAttachEndpoint(definition.engine)
+	);
 }
 
 function mergeBrowserDefinition(base: BrowserDefinition | undefined, override: RawBrowserDefinition): BrowserDefinition {
