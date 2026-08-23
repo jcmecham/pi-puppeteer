@@ -94,13 +94,13 @@ Responsibilities:
 - hide protocol differences from the Pi tool surface
 - expose common operations such as page selection, navigation, typing, screenshots, and inspection
 
-Initial adapter shape:
+Two adapters ship:
 
 - `ChromiumAdapter` via Puppeteer + CDP semantics
-
-Planned next:
-
 - `FirefoxAdapter` via Puppeteer + WebDriver BiDi
+
+They differ in how they find a browser's endpoint and in whether a live browser can be shared, not in
+the contract above them. See §9.
 
 ### C. Session manager layer
 
@@ -309,8 +309,9 @@ This keeps normal Pi tool actions and manual headed-browser interactions in the 
 
 - package scaffold
 - config loading
-- executable discovery for major Chromium browsers
+- executable discovery for major Chromium browsers and Firefox
 - launch configured browsers with named profiles
+- launch, adopt, and attach Firefox over WebDriver BiDi
 - attach to existing Chromium debugging endpoints
 - session + tab management
 - core interaction actions
@@ -324,7 +325,10 @@ This keeps normal Pi tool actions and manual headed-browser interactions in the 
 
 - Safari/WebKit support, which Puppeteer does not provide
 - mobile-only browser automation for Samsung Internet, UC Browser, and Android Browser
-- full Firefox parity
+- two Pi sessions driving one Firefox window at the same time: Firefox allows one WebDriver session
+  per browser process (Bug 1720707)
+- recovering a Firefox left running by a Pi process that was killed outright; its session cannot be
+  recreated, so the window has to be closed
 - raw CDP escape-hatch tooling
 - browser extension injection
 - advanced DOM replay / self-healing selectors
@@ -336,17 +340,66 @@ This keeps normal Pi tool actions and manual headed-browser interactions in the 
 - merging two same-named browser profiles from different projects
 - per-project isolation of a shared profile (use a distinct `profile` name instead)
 
-## 9. Firefox plan
+## 9. Firefox
 
-The current code structure should allow adding Firefox by implementing a dedicated adapter while keeping the same Pi tool contract.
+Firefox is implemented, over WebDriver BiDi, behind the same `BrowserAdapter` contract as Chromium.
+The tool surface above it does not branch on engine anywhere; the manager passes `engine` to
+`getAdapter` and is otherwise unaware of which protocol it is talking. What follows is the record of
+where the two adapters genuinely differ and why, so the differences are not rediscovered as bugs.
 
-Expected differences:
+**Finding the endpoint.** Chromium writes `DevToolsActivePort` and answers `/json/version` over HTTP.
+Firefox 152 has no CDP at all — no `cdp/` component, no `/json/version`, no `remote.active-protocols`
+pref to turn one on — so neither half of that pair exists. Its equivalents are
+`WebDriverBiDiServer.json` in the profile directory, holding `{ws_host, ws_port}`, and the
+`session.status` command over the WebSocket at `/session`. The adapter waits on the file rather than
+on the `WebDriver BiDi listening on …` line Firefox also prints to stderr, because the file is the
+only signal *another Pi process* can read, which is the whole point of the parallel. The stderr line
+is kept as a fallback and, more usefully, as the text attached to a failed launch: Firefox's own last
+words are the only explanation available when a launch does not come up, and the Chromium adapter has
+none.
 
-- protocol defaults move from CDP to WebDriver BiDi
-- feature parity for accessibility / inspect may differ
-- attach semantics may require separate handling from Chromium attach
+**One session per browser.** `WebDriverBiDi.createSession` throws `SessionNotCreatedError("Maximum
+number of active sessions")` if a session already exists; the source comment cites Bug 1720707. That
+makes `session.status` a three-state probe rather than a liveness check — nothing listening, listening
+and adoptable, listening and taken — and it is why `ProfileState`'s live variant carries
+`sessionAvailable` for Firefox. Two Pi sessions cannot share one Firefox window, and the second is
+told which project holds the first.
 
-That is why the tool surface must stay generic while the adapter layer stays protocol-aware.
+Adoption still works in one direction. Firefox releases its session on `session.end`, which is what
+puppeteer's `browser.disconnect()` sends, so a browser an earlier client let go of can be picked up.
+A dropped socket instead runs `onConnectionClose`, which unregisters the connection and leaves the
+session attached to nothing. The honest failure mode: a Pi process killed outright leaves a Firefox
+that is running, holding its profile, and impossible to reconnect to. Nothing can be done from this
+side; the window has to be closed, and the error says so. (On Windows the case is largely theoretical
+— the spawned browser shares the parent's job object and dies with it.)
+
+**Preferences.** `puppeteer.launch` is avoided for Firefox, and not for Chromium's Edge-refork reason.
+It would call `@puppeteer/browsers`' `createProfile`, which writes about sixty preferences into
+`user.js`. The asymmetry that makes that unacceptable here: Firefox's own `RecommendedPreferences`
+applies an overlapping list at startup and clears it again at `xpcom-shutdown`, so nothing it does
+persists — but a `user.js` value is copied into `prefs.js` on every start and survives deletion of
+`user.js`. One launch would therefore point a saved profile's `services.settings.server` at
+`http://dummy.test/` permanently.
+
+So the adapter provisions the profile itself, writing only what Firefox does not already handle
+(`fission.webContentIsolationStrategy`, first-run and startup-page suppression) plus the one thing
+Firefox handles in a way that is wrong here: it sets `signon.rememberSignons` and
+`signon.autofillForms` to `false` whenever a debugging port is passed, which would make a saved
+profile silently incapable of the one thing saved profiles are for. `applyPreferences` skips any pref
+that already has a user value, so writing them into `user.js` is the supported way to win.
+
+**Colliding with a browser Pi did not start.** Chromium's second launch on a held profile forwards its
+command line and exits — silent and survivable. Firefox's puts a modal dialog on screen and the
+endpoint poll then waits out its full timeout behind it. The Firefox adapter therefore checks
+`browserHoldsProfile` before spawning and refuses with an explanation. That check stays inside the
+adapter rather than becoming a fourth `ProfileState`: as a state it would change Chromium's answer
+for the same situation and invent a live profile with no endpoint to connect to, to solve a problem
+one guard already solves.
+
+**Process reaping** is shared (`src/adapters/reap.ts`), parameterised only by how each family spells
+its profile on the command line — Chromium joins it (`--user-data-dir=<dir>`), Firefox passes it as a
+separate argv entry (`--profile <dir>`, quoted when the path has spaces). Both matchers anchor the end
+of the argument so `…/default` cannot reap `…/default-2`.
 
 ## Recommended implementation sequence
 
@@ -357,7 +410,7 @@ That is why the tool surface must stay generic while the adapter layer stays pro
 5. implement core actions
 6. implement inspect + screenshot
 7. validate with Chrome/Edge/Brave/Opera/Vivaldi/Yandex configs
-8. add Firefox parity next milestone
+8. add the Firefox adapter over WebDriver BiDi (done; see §9)
 
 ## Source notes
 
@@ -366,6 +419,9 @@ Key references used in the design:
 - Puppeteer WebDriver BiDi docs: https://pptr.dev/webdriver-bidi
 - Puppeteer connect options: https://pptr.dev/api/puppeteer.connectoptions
 - Playwright BrowserType docs: https://playwright.dev/docs/api/class-browsertype
+- Firefox WebDriver BiDi docs: https://firefox-source-docs.mozilla.org/remote/index.html
+- Bugzilla 1773393, why `fission.webContentIsolationStrategy` must be 0: https://bugzilla.mozilla.org/show_bug.cgi?id=1773393
+- Bugzilla 1720707, one WebDriver session per Firefox: https://bugzilla.mozilla.org/show_bug.cgi?id=1720707
 - Browser Use repository: https://github.com/browser-use/browser-use
 - Browser Use CDP rationale post: https://browser-use.com/posts/playwright-to-cdp
 - Stagehand repository: https://github.com/browserbase/stagehand

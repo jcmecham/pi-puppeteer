@@ -2024,7 +2024,7 @@ const BrowserToolSchema = Type.Object({
 			"workflow_export",
 		] as const,
 	),
-	browserKey: Type.Optional(Type.String({ description: "Configured browser key, like chrome or edge; use system for the detected OS default browser" })),
+	browserKey: Type.Optional(Type.String({ description: "Configured browser key, like chrome, edge, or firefox; use system for the detected OS default browser" })),
 	sessionId: Type.Optional(Type.String({ description: "Browser session ID, like session-1" })),
 	tabId: Type.Optional(Type.String({ description: "Tab ID, like tab-1" })),
 	name: Type.Optional(Type.String({ description: "Friendly browser name shown in the browser manager" })),

@@ -4,9 +4,9 @@ import { createRequire } from "node:module";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Browser, Page } from "puppeteer-core";
-import { KnownDevices } from "puppeteer-core";
+import { KnownDevices, UnsupportedOperation } from "puppeteer-core";
 import { getAdapter } from "./adapters/index.ts";
-import { ensureStorageDir } from "./config.ts";
+import { ensureStorageDir, resolveAttachEndpoint } from "./config.ts";
 import { inspectProfile } from "./profile-lock.ts";
 import {
 	allocateSavedProfile,
@@ -35,6 +35,7 @@ import {
 	writeWorkflow,
 } from "./workflows.ts";
 import type {
+	BrowserEngine,
 	BrowserSessionRecord,
 	BrowserToolInput,
 	PageRecord,
@@ -102,6 +103,37 @@ export class BrowserManager {
 	}
 
 	async execute(input: BrowserToolInput): Promise<ToolResponse> {
+		try {
+			return await this.dispatch(input);
+		} catch (error) {
+			throw this.explainEngineLimit(input, error);
+		}
+	}
+
+	/**
+	 * Turn a bare protocol refusal into a sentence.
+	 *
+	 * Puppeteer signals "this transport does not implement that" by throwing `UnsupportedOperation`,
+	 * often with an empty message, so the action simply fails with nothing to read. WebDriver BiDi
+	 * refuses a handful of things CDP allows, and rather than guess which actions might hit one, catch
+	 * them all in the one place every action passes through.
+	 */
+	private explainEngineLimit(input: BrowserToolInput, error: unknown): unknown {
+		if (!(error instanceof UnsupportedOperation)) return error;
+		const engine = this.engineForInput(input);
+		const displayName = engine === "firefox" ? "Firefox" : "this browser";
+		const detail = error.message ? ` (${error.message})` : "";
+		return new Error(`${input.action} is not available on ${displayName}: WebDriver BiDi does not implement it${detail}.`, {
+			cause: error,
+		});
+	}
+
+	private engineForInput(input: BrowserToolInput): BrowserEngine | undefined {
+		const id = input.sessionId ?? this.currentSessionId;
+		return id ? this.sessions.get(id)?.engine : undefined;
+	}
+
+	private async dispatch(input: BrowserToolInput): Promise<ToolResponse> {
 		switch (input.action) {
 			case "list_browsers":
 				return this.listBrowsers();
@@ -298,7 +330,7 @@ export class BrowserManager {
 
 		const state = await inspectProfile(dir);
 		if (state.state !== "free") {
-			const owner = state.state === "live" ? state.owner : state.owner;
+			const owner = state.owner;
 			const where = owner?.cwd ? ` by Pi in ${owner.cwd}` : "";
 			throw new Error(`Cannot ${verb} profile '${profile}': a browser is running on it${where}. Close it first.`);
 		}
@@ -416,6 +448,7 @@ export class BrowserManager {
 				browserKey,
 				profile,
 				cwd: this.cwd,
+				temporary,
 			});
 
 			const session = await this.registerSession({
@@ -479,7 +512,7 @@ export class BrowserManager {
 		if (!definition) {
 			throw new Error(`Unknown browser key: ${browserKey}`);
 		}
-		const endpoint = input.endpoint ?? definition.attach?.browserWSEndpoint ?? definition.attach?.browserURL ?? "http://127.0.0.1:9222";
+		const endpoint = resolveAttachEndpoint(definition, input.endpoint);
 		const browser = await getAdapter(definition.engine).attach(definition, endpoint);
 
 		const session = await this.registerSession({
@@ -732,18 +765,21 @@ export class BrowserManager {
 		const session = this.resolveSession(input.sessionId);
 		const page = await this.resolvePage(session, input.tabId);
 
-		// Device preset (touch + UA + DPR + viewport) or manual viewport override.
-		// Runs over CDP (Emulation.setDeviceMetricsOverride), like DevTools device mode:
-		// it does not resize the physical window, so it is safe in attach mode too.
+		// Device preset (touch + UA + DPR + viewport) or manual viewport override. Chromium routes this
+		// through CDP's Emulation.setDeviceMetricsOverride and Firefox through WebDriver BiDi's
+		// browsingContext.setViewport plus emulation.setScreenOrientationOverride/setTouchOverride. Both
+		// are overrides rather than window resizes, so neither disturbs the browser window and both are
+		// safe in attach mode.
 		if (input.device) {
 			const known = (KnownDevices as Record<string, Parameters<typeof page.emulate>[0]>)[input.device];
 			if (!known) {
 				const available = Object.keys(KnownDevices).join(", ");
 				throw new Error(`Unknown device "${input.device}". Available: ${available}`);
 			}
+			const notes = firefoxEmulationNotes(session.engine, { isMobile: known.viewport?.isMobile, hasTouch: known.viewport?.hasTouch });
 			await page.emulate(known);
 			return {
-				text: `Emulating "${input.device}" on ${session.id}/${session.currentPageId}.`,
+				text: `Emulating "${input.device}" on ${session.id}/${session.currentPageId}.${notes}`,
 				details: { action: "emulate", sessionId: session.id, tabId: session.currentPageId, device: input.device },
 			};
 		}
@@ -758,10 +794,11 @@ export class BrowserManager {
 			hasTouch: input.hasTouch ?? input.isMobile ?? false,
 			deviceScaleFactor: input.deviceScaleFactor ?? 1,
 		};
+		const notes = firefoxEmulationNotes(session.engine, viewport);
 		await page.setViewport(viewport);
 		if (input.userAgent) await page.setUserAgent(input.userAgent);
 		return {
-			text: `Set viewport ${input.width}x${input.height} on ${session.id}/${session.currentPageId}.`,
+			text: `Set viewport ${input.width}x${input.height} on ${session.id}/${session.currentPageId}.${notes}`,
 			details: { action: "emulate", sessionId: session.id, tabId: session.currentPageId, viewport, userAgent: input.userAgent ?? null },
 		};
 	}
@@ -1817,4 +1854,27 @@ export class BrowserManager {
 		const rel = relative(this.cwd, path);
 		return rel && !rel.startsWith("..") ? rel : path;
 	}
+}
+
+
+/**
+ * What Firefox does differently when emulating, said out loud.
+ *
+ * Neither of these throws, so neither is discoverable from the result — the viewport simply behaves
+ * unlike Chromium's and the user has no way to know why. WebDriver BiDi has no `isMobile` equivalent
+ * and drops the flag, and changing touch emulation requires a reload, which BiDi performs for us.
+ */
+function firefoxEmulationNotes(
+	engine: BrowserEngine,
+	viewport: { isMobile?: boolean; hasTouch?: boolean } | undefined,
+): string {
+	if (engine !== "firefox" || !viewport) return "";
+	const notes: string[] = [];
+	if (viewport.isMobile) {
+		notes.push(
+			"Firefox applies the viewport, scale, and user agent but has no isMobile equivalent, so layout driven by that flag alone is unchanged.",
+		);
+	}
+	if (viewport.hasTouch) notes.push("Firefox reloads the tab when touch emulation changes, so unsaved page state is gone.");
+	return notes.length ? ` ${notes.join(" ")}` : "";
 }
