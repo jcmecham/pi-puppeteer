@@ -253,7 +253,7 @@ console.log("\nprofile management");
 console.log("\nprofile lock detection");
 
 {
-	const { browserHoldsProfile } = await import("../src/profile-lock.ts");
+	const { browserHoldsProfile, browserProvablyHoldsProfile } = await import("../src/profile-lock.ts");
 
 	const root = join(ROOT, "locks");
 	const dir = (name: string) => {
@@ -274,6 +274,7 @@ console.log("\nprofile lock detection");
 		process.platform === "win32" ? !browserHoldsProfile(stale) : browserHoldsProfile(stale),
 		"on POSIX an fcntl lock is undetectable, so unprovable still counts as in use",
 	);
+	check("...and unprovable is never mistaken for proof", !browserProvablyHoldsProfile(stale));
 
 	// A lock symlink outlives a crash, so the pid it names is what decides. A genuinely dead pid has
 	// to be earned: pid 1 is alive and root-owned, and `kill(1, 0)` answers EPERM, which means "exists,
@@ -301,7 +302,54 @@ console.log("\nprofile lock detection");
 		const unparseable = dir("unparseable");
 		symlinkSync("no-pid-here", join(unparseable, "SingletonLock"));
 		check("an unreadable lock target counts as in use on POSIX", browserHoldsProfile(unparseable));
+
+		check("a live lock symlink is proof, not a guess", browserProvablyHoldsProfile(live));
+		check("a dead lock symlink proves nothing", !browserProvablyHoldsProfile(dead));
+		check("an unreadable lock target proves nothing either", !browserProvablyHoldsProfile(unparseable));
+
+		// The regression the launch gate exists to avoid, in the shape Firefox actually leaves behind:
+		// `.parentlock` is a plain file it fcntl-locks and never unlinks, so on POSIX it survives every
+		// clean exit. Read as "in use" it would refuse to launch any profile that had ever run Firefox.
+		const firefoxExited = dir("firefox-exited-posix");
+		writeFileSync(join(firefoxExited, ".parentlock"), "", "utf8");
+		check("a Firefox that ran and exited can be launched again", !browserProvablyHoldsProfile(firefoxExited));
+		check(
+			"...while the same profile is still too risky to rename or delete",
+			browserHoldsProfile(firefoxExited),
+			"the cautious answer has to stay cautious for its own caller",
+		);
 	}
+}
+
+console.log("\nprofile process detection");
+
+{
+	const { browserProcessOnProfile, FIREFOX_PROFILE_ARG } = await import("../src/adapters/reap.ts");
+	const { spawn } = await import("node:child_process");
+
+	// What the launch gate falls back to when the lock files cannot say. Stand in for Firefox with a
+	// node that idles under the same `--profile <dir>` argument, since the matcher reads a command
+	// line and does not care what wrote it.
+	const held = join(ROOT, "process-held");
+	mkdirSync(held, { recursive: true });
+	const free = join(ROOT, "process-free");
+	mkdirSync(free, { recursive: true });
+
+	// `--` first, or node claims `--profile` as one of its own options and exits before it can stand in
+	// for anything. The command line still reads `--profile <dir>`, which is all the matcher looks at.
+	const idle = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000)", "--", "--profile", held], {
+		stdio: "ignore",
+	});
+	const exited = new Promise<void>((resolve) => idle.on("exit", () => resolve()));
+	// Give the process list a moment to show a process that was spawned microseconds ago.
+	await new Promise((resolve) => setTimeout(resolve, 500));
+
+	check("a process holding the profile is found", await browserProcessOnProfile(held, FIREFOX_PROFILE_ARG));
+	check("a profile nothing is running on is not", !(await browserProcessOnProfile(free, FIREFOX_PROFILE_ARG)));
+
+	idle.kill();
+	await exited;
+	check("and it is gone once the process is", !(await browserProcessOnProfile(held, FIREFOX_PROFILE_ARG)));
 }
 
 console.log("\nfirefox endpoint normalization");

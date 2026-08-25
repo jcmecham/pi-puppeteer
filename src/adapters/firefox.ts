@@ -7,6 +7,7 @@ import type { BrowserDefinition } from "../types.ts";
 import type { ProfileOwner } from "../profile-lock.ts";
 import {
 	browserHoldsProfile,
+	browserProvablyHoldsProfile,
 	clearBidiEndpoint,
 	clearOwner,
 	inspectProfile,
@@ -19,7 +20,7 @@ import {
 } from "../profile-lock.ts";
 import type { BrowserAdapter, LaunchRequest, LaunchResult } from "./base.ts";
 import { ensureFirefoxPrefs } from "./firefox-profile.ts";
-import { FIREFOX_PROFILE_ARG, reapProcesses } from "./reap.ts";
+import { browserProcessOnProfile, FIREFOX_PROFILE_ARG, reapProcesses } from "./reap.ts";
 
 /**
  * Firefox over WebDriver BiDi.
@@ -82,7 +83,7 @@ export class FirefoxAdapter implements BrowserAdapter {
 		// can afford to ignore that case — a second launch silently forwards its command line and exits
 		// — but Firefox puts a modal "Firefox is already running" dialog on screen and our endpoint poll
 		// then waits out its full timeout behind it. Refuse up front instead.
-		if (browserHoldsProfile(request.userDataDir)) {
+		if (await firefoxHoldsProfile(request.userDataDir)) {
 			throw new Error(
 				`A Firefox window is already open on profile '${request.profile}', outside Pi. Firefox allows one ` +
 					"process per profile, so Pi cannot start a second one. Close that window, or pass a different `profile`.",
@@ -171,6 +172,24 @@ export class FirefoxAdapter implements BrowserAdapter {
 }
 
 /**
+ * Is a Firefox outside Pi holding this profile?
+ *
+ * Two questions, cheapest first. A lock symlink naming a live process — or on Windows a marker the OS
+ * will not hand over — settles it for nothing. What is left is the case only POSIX has: a
+ * `.parentlock` that proves nothing either way, because Firefox locks it with fcntl and never removes
+ * it, so every profile that has ever run Firefox looks exactly like one running Firefox now. Reading
+ * that as "held" is what would refuse a launch on any Linux or macOS profile after its first run.
+ *
+ * Only that genuinely undecidable case reaches the process list, and it costs one `pgrep` on a path
+ * that is about to spawn a browser.
+ */
+async function firefoxHoldsProfile(userDataDir: string): Promise<boolean> {
+	if (browserProvablyHoldsProfile(userDataDir)) return true;
+	if (!browserHoldsProfile(userDataDir)) return false;
+	return await browserProcessOnProfile(userDataDir, FIREFOX_PROFILE_ARG);
+}
+
+/**
  * Normalize whatever endpoint spelling reached us into the one Firefox actually serves.
  *
  * `--remote-debugging-port` reads like an HTTP thing, every other browser in the config uses an
@@ -218,8 +237,12 @@ async function waitForBidiEndpoint(userDataDir: string, stderr: () => string, ti
 	const logged = /^WebDriver BiDi listening on (ws:\/\/\S+)$/m.exec(stderr());
 	if (logged?.[1] && (await probeBidiStatus(logged[1])).reachable) return logged[1];
 
+	// The guard before the spawn catches a foreign Firefox on this profile in every case it can see
+	// one. If it could not — no `pgrep` on the box, a browser started some way that does not name the
+	// directory — this timeout is where that lands, behind a modal dialog nothing here can read.
 	throw new Error(
-		`Firefox did not report a WebDriver BiDi endpoint within ${timeoutMs}ms. The browser may have failed to start.`,
+		`Firefox did not report a WebDriver BiDi endpoint within ${timeoutMs}ms. The browser may have failed to ` +
+			"start, or a Firefox already open on this profile may be holding the launch behind a dialog.",
 	);
 }
 

@@ -81,9 +81,55 @@ export async function reapProcesses(
 	}
 }
 
+/**
+ * Is a browser process bound to this profile directory right now?
+ *
+ * The same evidence `reapProcesses` acts on, asked as a question instead of an order. Lock files
+ * answer this cheaply but not everywhere: a Firefox holding a profile on macOS leaves only an fcntl
+ * lock on `.parentlock`, which no ordinary open can detect and which outlives the browser anyway.
+ * The process list has no such blind spot.
+ *
+ * Best-effort in the safe direction — a missing `pgrep`, an unavailable PowerShell, anything at all
+ * going wrong answers false. A launch that proceeds and then fails carries the browser's own words;
+ * a launch blocked by a tool that could not run carries nothing.
+ */
+export async function browserProcessOnProfile(userDataDir: string, matcher: ProfileArgMatcher): Promise<boolean> {
+	try {
+		if (process.platform === "win32") {
+			// The path travels via an env var for the same reason it does above, and because the script's
+			// own command line would otherwise match the pattern it is searching for.
+			const script =
+				"$udd=$env:PI_PUPPETEER_UDD; " +
+				`$pattern=${matcher.powershell}; ` +
+				"$hit = Get-CimInstance Win32_Process | " +
+				"Where-Object { $_.CommandLine -and $_.CommandLine -match $pattern } | " +
+				"Select-Object -First 1; " +
+				"if ($hit) { exit 0 } else { exit 1 }";
+			return await exitedZero(
+				spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+					stdio: "ignore",
+					env: { ...process.env, PI_PUPPETEER_UDD: userDataDir },
+				}),
+			);
+		}
+		// `pgrep -f` exits 0 when something matched and 1 when nothing did, and never matches itself.
+		return await exitedZero(spawn("pgrep", ["-f", "--", matcher.posix(userDataDir)], { stdio: "ignore" }));
+	} catch {
+		return false;
+	}
+}
+
 export function runToCompletion(child: ChildProcess): Promise<void> {
 	return new Promise((resolve) => {
 		child.on("error", () => resolve());
 		child.on("exit", () => resolve());
+	});
+}
+
+/** True only when the child exited 0. A spawn error — no such binary — is false, not a throw. */
+function exitedZero(child: ChildProcess): Promise<boolean> {
+	return new Promise((resolve) => {
+		child.on("error", () => resolve(false));
+		child.on("exit", (code) => resolve(code === 0));
 	});
 }

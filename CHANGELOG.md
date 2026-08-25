@@ -47,6 +47,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- On Linux and macOS, a saved Firefox profile could be launched once and never again. The guard that
+  refuses to start a second Firefox on a profile answered "is a browser holding this?" from lock
+  files, and on POSIX a lock file cannot answer: Firefox holds `.parentlock` with an fcntl lock no
+  ordinary open can see, and deliberately leaves the file behind when it exits. Unable to prove the
+  profile free, the guard assumed it was busy — so every launch after the first failed, telling the
+  user to close a Firefox window that was not open. The guard now acts on proof (a lock symlink
+  naming a process that is still alive) and, where the lock files genuinely cannot say, on whether a
+  Firefox is running on that profile directory at all. Windows was never affected, which is why
+  testing there did not show it.
 - A running Firefox profile reported as free, so the startup sweep could delete a throwaway profile
   directory out from under the browser still writing to it, and `delete_profile` would remove a
   profile a browser was holding. "Is anything using this?" was answered by asking for a Chromium

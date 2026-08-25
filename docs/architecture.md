@@ -390,8 +390,18 @@ that already has a user value, so writing them into `user.js` is the supported w
 
 **Colliding with a browser Pi did not start.** Chromium's second launch on a held profile forwards its
 command line and exits — silent and survivable. Firefox's puts a modal dialog on screen and the
-endpoint poll then waits out its full timeout behind it. The Firefox adapter therefore checks
-`browserHoldsProfile` before spawning and refuses with an explanation. That check stays inside the
+endpoint poll then waits out its full timeout behind it. The Firefox adapter therefore checks for a
+browser on the profile before spawning and refuses with an explanation.
+
+What that check must not do is guess. `browserHoldsProfile` resolves "cannot tell" as held, which is
+right for the caller it was written for — a rename or delete that would corrupt a live profile — and
+inverted here, where a wrong "held" refuses to start a browser nothing is using and names a window
+the user cannot find. Firefox makes that permanent on POSIX: it fcntl-locks `.parentlock` and never
+unlinks it, so a profile that has ever run Firefox is undecidable from its lock files ever after. The
+gate therefore takes proof where proof exists (`browserProvablyHoldsProfile` — a lock symlink naming a
+live pid, or on Windows a marker the OS will not hand over) and asks the process list for the rest
+(`browserProcessOnProfile`, the question form of the sweep `reapProcesses` already performs). That
+check stays inside the
 adapter rather than becoming a fourth `ProfileState`: as a state it would change Chromium's answer
 for the same situation and invent a live profile with no endpoint to connect to, to solve a problem
 one guard already solves.

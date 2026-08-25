@@ -304,17 +304,41 @@ const LOCK_MARKERS = ["SingletonLock", "SingletonCookie", "SingletonSocket", "lo
  *
  * This answers a narrower question than `inspectProfile`, which needs a live debugging endpoint. Lock
  * files are all a browser Pi did not launch leaves behind, and migration has to cope with those.
+ *
+ * Resolving "cannot tell" as held is right for that caller and wrong for one that is deciding whether
+ * to *start* a browser — see `browserProvablyHoldsProfile`.
  */
 export function browserHoldsProfile(profileDir: string): boolean {
-	return LOCK_MARKERS.some((marker) => markerIsHeld(join(profileDir, marker)));
+	return LOCK_MARKERS.some((marker) => markerState(join(profileDir, marker)) !== "free");
 }
 
-function markerIsHeld(markerPath: string): boolean {
+/**
+ * The same question, answered only where the answer can be proven.
+ *
+ * The asymmetry above cuts the other way for a launch. Refusing to rename a profile costs a retry;
+ * refusing to launch one prints "close that window" about a window that does not exist, and leaves
+ * the user nothing to act on. Firefox turns that from occasional into permanent: `.parentlock` is a
+ * plain file it locks with fcntl and deliberately never unlinks (`// Don't remove it`, in
+ * `nsProfileLock::Unlock`), so on POSIX every profile that has ever run Firefox is unprovable from
+ * then on — and a cautious launch gate would refuse it forever after the first run.
+ *
+ * So only real evidence counts here: a lock symlink naming a process that is still alive, or on
+ * Windows a marker the OS refuses to hand over. "Cannot tell" is false, and a caller that needs the
+ * unprovable case settled asks the process list instead — see `browserProcessOnProfile`.
+ */
+export function browserProvablyHoldsProfile(profileDir: string): boolean {
+	return LOCK_MARKERS.some((marker) => markerState(join(profileDir, marker)) === "held");
+}
+
+/** What one marker proves: a browser holds the profile, none does, or the marker cannot say. */
+type MarkerState = "held" | "free" | "unknown";
+
+function markerState(markerPath: string): MarkerState {
 	let isSymbolicLink: boolean;
 	try {
 		isSymbolicLink = lstatSync(markerPath).isSymbolicLink();
 	} catch {
-		return false; // No marker at all: nothing has claimed this profile.
+		return "free"; // No marker at all: nothing has claimed this profile.
 	}
 
 	// Chromium points SingletonLock at "<hostname>-<pid>" and Firefox points lock at "<ip>:+<pid>".
@@ -326,19 +350,19 @@ function markerIsHeld(markerPath: string): boolean {
 		} catch {
 			pid = undefined;
 		}
-		return pid === undefined ? process.platform !== "win32" : isProcessAlive(pid);
+		if (pid === undefined) return process.platform === "win32" ? "free" : "unknown";
+		return isProcessAlive(pid) ? "held" : "free";
 	}
 
-	// A POSIX lock file is held with fcntl, which an ordinary open cannot detect. Unprovable means in
-	// use, because the rename that follows would not fail on our behalf.
-	if (process.platform !== "win32") return true;
+	// A POSIX lock file is held with fcntl, which an ordinary open cannot detect.
+	if (process.platform !== "win32") return "unknown";
 
 	try {
 		closeSync(openSync(markerPath, "r+"));
-		return false;
+		return "free";
 	} catch (error) {
 		// ENOENT means it vanished between the stat and the open, so nothing is holding it.
-		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? "free" : "held";
 	}
 }
 
