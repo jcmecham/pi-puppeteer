@@ -65,6 +65,8 @@ Run `/browser` in Pi to open the browser manager. From there, you can:
 
 Open browser sessions appear above the editor as a `Browser Session(s)` indicator. You can also press `Alt+B` to open the browser manager.
 
+If `Alt+B` does nothing, the terminal itself is claiming the key before Pi ever sees it — VS Code can, depending on its keybindings, and no setting inside Pi can reach that. Either free the key in the host terminal (in VS Code, `terminal.integrated.commandsToSkipShell` and `terminal.integrated.sendKeybindingsToShell` control this) or run `/browser`, which opens the same screen.
+
 ## Tools exposed to Pi
 
 The package exposes one primary browser-control tool plus dedicated workflow helpers:

@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `Alt+B`, `Alt+R`, and `Alt+S` did nothing in terminals that negotiate a modern keyboard protocol,
+  VS Code's among them. The shortcuts were matched by comparing the raw bytes against `ESC` plus the
+  letter, which is only how a terminal speaking neither protocol sends them. Pi queries for the Kitty
+  keyboard protocol on startup and falls back to xterm's `modifyOtherKeys`, and under either one the
+  same keypress arrives as `\x1b[98;3u` or `\x1b[27;3;98~` instead, so the comparison silently never
+  fired. Matching now goes through Pi's own protocol-aware `matchesKey`.
 - A migration that could never finish. A profile was treated as in use whenever a browser lock file
   was present, but Firefox creates `parent.lock` once and never removes it — it holds the file open
   exclusively while running instead. Any Firefox profile that had ever run therefore reported as open

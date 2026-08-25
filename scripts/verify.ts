@@ -628,6 +628,41 @@ console.log("\nscreen height is a function of the data, not the interaction");
 	}
 }
 
+console.log("\nglobal Alt shortcuts");
+
+{
+	const { matchesAltShortcut } = await import("../src/index.ts");
+
+	// The regression behind TODO-281. Comparing raw bytes against `\x1b<letter>` only recognizes
+	// terminals that speak neither modern keyboard protocol. Pi negotiates the Kitty keyboard
+	// protocol and falls back to xterm modifyOtherKeys, and under those the very same keypress
+	// arrives encoded differently — so Alt+B silently did nothing in VS Code while working in a
+	// plainer terminal. These three encodings are the whole point of the fix.
+	const encodings = (codePoint: number) => ({
+		legacy: `\x1b${String.fromCodePoint(codePoint)}`,
+		kitty: `\x1b[${codePoint};3u`,
+		modifyOtherKeys: `\x1b[27;3;${codePoint}~`,
+	});
+
+	for (const [letter, codePoint] of [["b", 98], ["r", 114], ["s", 115]] as const) {
+		const upper = letter.toUpperCase();
+		const { legacy, kitty, modifyOtherKeys } = encodings(codePoint);
+		check(`Alt+${upper} is matched in a legacy terminal`, matchesAltShortcut(legacy, letter));
+		check(`Alt+${upper} is matched under the Kitty keyboard protocol`, matchesAltShortcut(kitty, letter));
+		check(`Alt+${upper} is matched under xterm modifyOtherKeys`, matchesAltShortcut(modifyOtherKeys, letter));
+	}
+
+	// Each shortcut answers only for its own letter, in every encoding.
+	check("Alt+B does not answer for Alt+R", !matchesAltShortcut("\x1br", "b"));
+	check("Alt+B does not answer for Alt+R under Kitty", !matchesAltShortcut("\x1b[114;3u", "b"));
+
+	// A typed letter must still reach the editor, and Ctrl is not Alt: taking ctrl+b would steal the
+	// editor's cursor-left, which is why the shortcut stayed on Alt rather than moving to Ctrl+B.
+	check("a typed b is not the shortcut", !matchesAltShortcut("b", "b"));
+	check("Ctrl+B is not the shortcut", !matchesAltShortcut("\x02", "b"));
+	check("Ctrl+B under Kitty is not the shortcut", !matchesAltShortcut("\x1b[98;5u", "b"));
+}
+
 rmSync(ROOT, { recursive: true, force: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);
