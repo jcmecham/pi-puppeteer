@@ -813,6 +813,38 @@ console.log("\nscreen height is a function of the data, not the interaction");
 	}
 }
 
+console.log("\nemulation on browsers without the emulation.* commands");
+{
+	const { ProtocolError } = await import("puppeteer-core");
+	const { emulationSkipNote, unknownEmulationCommand, unknownProtocolCommand } = await import("../src/emulation.ts");
+
+	// Firefox's own phrasing, stack trace and all — the thing the matcher has to survive.
+	const orientation = new ProtocolError(
+		"Protocol error (emulation.setScreenOrientationOverride): unknown command emulation.setScreenOrientationOverride " +
+			"RemoteError@chrome://remote/content/shared/RemoteError.sys.mjs:8:8",
+	);
+	const userAgent = new ProtocolError("Protocol error (emulation.setUserAgentOverride): unknown command emulation.setUserAgentOverride");
+	const other = new ProtocolError("Protocol error (script.evaluate): unknown command script.evaluate");
+
+	check("an unknown emulation command is recognised", unknownEmulationCommand(orientation) === "emulation.setScreenOrientationOverride", String(unknownEmulationCommand(orientation)));
+	check("so is the user agent one", unknownEmulationCommand(userAgent) === "emulation.setUserAgentOverride", String(unknownEmulationCommand(userAgent)));
+	check("a non-emulation command is not claimed by the workaround", unknownEmulationCommand(other) === undefined, String(unknownEmulationCommand(other)));
+	check("but it is still recognised as a missing command", unknownProtocolCommand(other) === "script.evaluate", String(unknownProtocolCommand(other)));
+
+	// A real bug must keep its own error rather than be mistaken for an old browser.
+	check("an unrelated protocol error is left alone", unknownProtocolCommand(new ProtocolError("Protocol error (browsingContext.navigate): timeout")) === undefined);
+	check("a plain Error is left alone", unknownProtocolCommand(new Error("unknown command emulation.setUserAgentOverride")) === undefined);
+
+	check("nothing skipped means no note", emulationSkipNote([]) === "");
+	const orientationNote = emulationSkipNote(["screen orientation"]);
+	check("the note names the version that fixes it", orientationNote.includes("Firefox 144 or newer"), orientationNote);
+	check("the note confirms the size still applied", orientationNote.includes("viewport size was applied"), orientationNote);
+	const bothNote = emulationSkipNote(["screen orientation", "user agent"]);
+	check("a mixed note quotes the higher version", bothNote.includes("Firefox 145 or newer"), bothNote);
+	check("a mixed note reads as a list", bothNote.includes("screen orientation and user agent"), bothNote);
+	check("a user-agent-only note does not mention the touch cutoff", !emulationSkipNote(["user agent"]).includes("144"), emulationSkipNote(["user agent"]));
+}
+
 rmSync(ROOT, { recursive: true, force: true });
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
 process.exit(failures ? 1 : 0);

@@ -14,6 +14,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   record, and record and replay workflows. What differs is that Firefox allows exactly one automation
   session per browser, so two Pi sessions cannot share one window the way two can share Chrome. The
   second one is told which project is holding it, by name, instead of failing obscurely.
+- `emulate` works on a Firefox that predates the `emulation.*` BiDi commands, which means the whole
+  140 ESR line. Puppeteer sets the viewport and the screen orientation in one batch, so on an older
+  browser the orientation command it cannot answer failed the entire call and no viewport was ever
+  applied. Pi now re-issues the part that works and names the refinements — orientation, touch, user
+  agent — the browser was too old for, instead of throwing a protocol stack trace. Checking a layout
+  at a phone width works on every Firefox back to 140.
+- An action that fails because the browser build is too old now says which command is missing.
+  Firefox reports these as a protocol error wrapped around a `chrome://` stack trace, which buried
+  the one useful word in several screens of noise.
 - Pi writes six preferences into a marked block in a Firefox profile's `user.js` and leaves the
   rest of the file alone. Puppeteer's own Firefox support writes about sixty, one of which switches
   the password manager off — reasonable for a test harness, wrong for a profile whose entire job is

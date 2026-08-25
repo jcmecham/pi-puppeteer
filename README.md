@@ -207,6 +207,11 @@ at startup and clears them again when it exits, so writing them here would only 
 scale, and user agent are applied, but layout that keys off that flag alone is unchanged. Turning
 touch emulation on or off reloads the tab.
 
+**On Firefox older than 145, `emulate` still resizes the viewport.** Screen orientation, touch, and
+user-agent emulation arrived as WebDriver BiDi commands in Firefox 144 and 145; on anything earlier —
+the whole 140 ESR line included — Pi applies the size and tells you which refinements the browser was
+too old for, rather than failing the action. Checking a layout at 390px wide works everywhere.
+
 ## Screenshots and recordings
 
 Screenshots and recordings are saved under the project artifact directory by default:
