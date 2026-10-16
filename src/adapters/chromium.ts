@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostname } from "node:os";
@@ -16,6 +16,7 @@ import {
 	writeOwner,
 } from "../profile-lock.ts";
 import type { BrowserAdapter, LaunchRequest, LaunchResult } from "./base.ts";
+import { CHROMIUM_PROFILE_ARG, reapProcesses } from "./reap.ts";
 
 export class ChromiumAdapter implements BrowserAdapter {
 	readonly engine = "chromium" as const;
@@ -26,6 +27,16 @@ export class ChromiumAdapter implements BrowserAdapter {
 		// and exits. Detect that case up front and connect to the existing browser as a guest.
 		let state = await inspectProfile(request.userDataDir);
 		if (state.state === "starting") state = await waitForProfileSettled(request.userDataDir);
+
+		// A Firefox-shaped profile under a Chromium browser key is a configuration mistake, not
+		// something to spawn into: its user data dir holds a Firefox profile and a second browser on
+		// top of it would corrupt both.
+		if (state.state === "live" && state.engine === "firefox") {
+			throw new Error(
+				`Profile '${request.profile}' is being used by Firefox, so ${request.browserKey} cannot open it. ` +
+					"Pass a different `profile`, or start this session with the firefox browser key.",
+			);
+		}
 
 		if (state.state === "live") {
 			const adoptedBrowser = await puppeteer.connect({ browserURL: state.browserURL, defaultViewport: null });
@@ -76,7 +87,7 @@ export class ChromiumAdapter implements BrowserAdapter {
 		} catch (error) {
 			// Sweep by user data dir only while we still hold the claim: a failed launch here must
 			// never reap a browser that another Pi session owns on this shared profile.
-			await reapProcesses(child, request.userDataDir, ownedByThisProcess(request.userDataDir));
+			await reapProcesses(child, request.userDataDir, ownedByThisProcess(request.userDataDir), CHROMIUM_PROFILE_ARG);
 			clearOwner(request.userDataDir);
 			throw error;
 		}
@@ -91,7 +102,7 @@ export class ChromiumAdapter implements BrowserAdapter {
 			// gracefully, then reap anything still bound to our dedicated profile dir.
 			dispose: async () => {
 				await browser.close().catch(() => undefined);
-				await reapProcesses(child, request.userDataDir, ownedByThisProcess(request.userDataDir));
+				await reapProcesses(child, request.userDataDir, ownedByThisProcess(request.userDataDir), CHROMIUM_PROFILE_ARG);
 				clearOwner(request.userDataDir);
 				// Reaping force-kills, so Chromium never removes its own port file. Left behind, it
 				// would advertise a port that some unrelated process could later bind.
@@ -131,53 +142,4 @@ async function waitForDevToolsEndpoint(userDataDir: string, timeoutMs = 30_000):
 	throw new Error(
 		`Browser debugging endpoint did not become available within ${timeoutMs}ms. The browser may have failed to start.`,
 	);
-}
-
-// Best-effort teardown: kill the process we spawned and any browser process still bound to the same
-// user data dir (catches Edge's reparented forks).
-//
-// `sweepByUserDataDir` must be false unless we own the profile. Profiles are shared across projects
-// now, so a blind sweep would kill a browser another Pi session is driving.
-async function reapProcesses(child: ChildProcess, userDataDir: string, sweepByUserDataDir: boolean): Promise<void> {
-	if (child.pid !== undefined) {
-		try {
-			child.kill();
-		} catch {
-			// already gone
-		}
-	}
-
-	if (!sweepByUserDataDir) return;
-
-	try {
-		if (process.platform === "win32") {
-			// Match the whole --user-data-dir argument, not a substring: ".../profiles/chrome/default"
-			// is a prefix of ".../profiles/chrome/default-2", and a Contains() test would reap both.
-			// The path travels via an env var to sidestep quoting/escaping of backslashes.
-			const script =
-				"$udd=$env:PI_PUPPETEER_UDD; " +
-				"$pattern=[regex]::Escape('--user-data-dir=' + $udd) + '(?:\"|\\s|$)'; " +
-				"Get-CimInstance Win32_Process | " +
-				"Where-Object { $_.CommandLine -and $_.CommandLine -match $pattern } | " +
-				"ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
-			await runToCompletion(
-				spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-					stdio: "ignore",
-					env: { ...process.env, PI_PUPPETEER_UDD: userDataDir },
-				}),
-			);
-		} else {
-			const pattern = `--user-data-dir=${userDataDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[ "])`;
-			await runToCompletion(spawn("pkill", ["-f", "--", pattern], { stdio: "ignore" }));
-		}
-	} catch {
-		// process reaping is best-effort
-	}
-}
-
-function runToCompletion(child: ChildProcess): Promise<void> {
-	return new Promise((resolve) => {
-		child.on("error", () => resolve());
-		child.on("exit", () => resolve());
-	});
 }

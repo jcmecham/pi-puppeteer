@@ -10,6 +10,10 @@ export interface LaunchRequest {
 	browserKey: string;
 	profile: string;
 	cwd: string;
+	// Whether the profile is throwaway. Only Firefox reads it: a saved Firefox profile has to have
+	// the password manager switched back on, which Firefox turns off by itself whenever a debugging
+	// port is passed. See src/adapters/firefox-profile.ts.
+	temporary: boolean;
 }
 
 export interface LaunchResult {
