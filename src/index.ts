@@ -3,6 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, KeybindingsManager } from "@earendil-works/pi-coding-agent";
+import { type KeyId, matchesKey } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { ensureStorageDir, loadConfig } from "./config.ts";
 import { BrowserManager } from "./manager.ts";
@@ -1140,6 +1141,21 @@ function matchesShortcut(data: string, shortcut: string): boolean {
 	return printableShortcut(data) === shortcut.toLowerCase();
 }
 
+/**
+ * Alt+<letter> under every encoding Pi may be running with.
+ *
+ * Comparing raw bytes against `\x1b<letter>` only covers terminals that speak neither modern
+ * keyboard protocol. Pi queries for the Kitty keyboard protocol on startup and falls back to
+ * xterm's modifyOtherKeys, and under either one the same key arrives as `\x1b[<code>;3u` or
+ * `\x1b[27;3;<code>~` instead — which is why these shortcuts looked dead in VS Code while
+ * working elsewhere. `matchesKey` is protocol-aware, so it is the only correct comparison.
+ *
+ * Exported for `scripts/verify.ts`, which pins all three encodings.
+ */
+export function matchesAltShortcut(data: string, letter: string): boolean {
+	return matchesKey(data, `alt+${letter}` as KeyId);
+}
+
 async function showWorkflowRecordingScreen(
 	ctx: ExtensionContext,
 	browserManager: BrowserManager,
@@ -1453,11 +1469,11 @@ class WorkflowRecordingUiController {
 
 	private handleTerminalInput(data: string): { consume?: boolean; data?: string } | undefined {
 		if (!this.activeRecording) return undefined;
-		if (data === "\x1br" || data === "\x1bR") {
+		if (matchesAltShortcut(data, "r")) {
 			void this.open();
 			return { consume: true };
 		}
-		if (data === "\x1bs" || data === "\x1bS") {
+		if (matchesAltShortcut(data, "s")) {
 			void this.stopAndSave();
 			return { consume: true };
 		}
@@ -1975,7 +1991,7 @@ class BrowserSessionsUiController {
 	}
 
 	private handleTerminalInput(data: string): { consume?: boolean; data?: string } | undefined {
-		if (data === "\x1bb" || data === "\x1bB") {
+		if (matchesAltShortcut(data, "b")) {
 			void this.open();
 			return { consume: true };
 		}
